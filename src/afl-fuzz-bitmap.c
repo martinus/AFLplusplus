@@ -268,6 +268,103 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 
 }
 
+/* A combination of classify_counts and has_new_bits. 
+   Updates the trace bits with classified values AND updates virgin_map.
+   Returns 1 if hit count changed, 2 if new tuple seen. */
+
+static inline u8 has_new_bits_and_classify(afl_state_t *afl, u8 *virgin_map) {
+
+#ifdef WORD_SIZE_64
+
+  u64 *current = (u64 *)afl->fsrv.trace_bits;
+  u64 *virgin = (u64 *)virgin_map;
+
+  u32 i = ((afl->fsrv.real_map_size + 7) >> 3);
+
+#else
+
+  u32 *current = (u32 *)afl->fsrv.trace_bits;
+  u32 *virgin = (u32 *)virgin_map;
+
+  u32 i = ((afl->fsrv.real_map_size + 3) >> 2);
+
+#endif                                                     /* ^WORD_SIZE_64 */
+
+  u8 ret = 0;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(WORD_SIZE_64)
+
+  const __m512i lut_low = _mm512_broadcast_i32x4(_mm_set_epi8(
+      16, 16, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 4, 2, 1, 0));
+
+  const __m512i v_128 = _mm512_set1_epi8(128);
+  const __m512i v_64 = _mm512_set1_epi8(64);
+  const __m512i v_32 = _mm512_set1_epi8(32);
+  const __m512i v_15 = _mm512_set1_epi8(15);
+  const __m512i v_31 = _mm512_set1_epi8(31);
+  const __m512i v_127 = _mm512_set1_epi8(127);
+  const __m512i v_ff = _mm512_set1_epi8(0xFF);
+
+  while (i >= 8) {
+
+    __m512i v = _mm512_loadu_si512((void *)current);
+
+    /* Optimize for sparse bitmaps. */
+    if (_mm512_test_epi64_mask(v, v)) {
+
+      __m512i   res_low = _mm512_shuffle_epi8(lut_low, v);
+      __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(v, v_15, _MM_CMPINT_GT);
+      __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(v, v_31, _MM_CMPINT_GT);
+      __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(v, v_127, _MM_CMPINT_GT);
+
+      __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64);
+      res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128);
+      __m512i classified = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high);
+
+      _mm512_storeu_si512((void *)current, classified);
+      
+      __m512i v_vir = _mm512_loadu_si512((void *)virgin);
+      if (_mm512_test_epi8_mask(classified, v_vir)) {
+          if (likely(ret < 2)) {
+               __mmask64 m_cur_nz = _mm512_test_epi8_mask(classified, classified);
+               __mmask64 m_vir_ff = _mm512_cmpeq_epu8_mask(v_vir, v_ff);
+               if (m_cur_nz & m_vir_ff) ret = 2;
+               else ret = 1;
+          }
+          __m512i v_new_vir = _mm512_andnot_si512(classified, v_vir);
+          _mm512_storeu_si512((void *)virgin, v_new_vir);
+      }
+
+    }
+
+    current += 8;
+    virgin += 8;
+    i -= 8;
+
+  }
+
+#endif
+
+  while (i--) {
+
+    if (unlikely(*current)) {
+        
+        *current = classify_word(*current);
+        if (unlikely(*current)) discover_word(&ret, current, virgin);
+    }
+    
+    current++;
+    virgin++;
+
+  }
+
+  if (unlikely(ret) && likely(virgin_map == afl->virgin_bits))
+    afl->bitmap_changed = 1;
+
+  return ret;
+
+}
+
 /* A combination of classify_counts and has_new_bits. If 0 is returned, then the
  * trace bits are kept as-is. Otherwise, the trace bits are overwritten with
  * classified values.
@@ -275,8 +372,7 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
  * This accelerates the processing: in most cases, no interesting behavior
  * happen, and the trace bits will be discarded soon. This function optimizes
  * for such cases: one-pass scan on trace bits without modifying anything. Only
- * on rare cases it fall backs to the slow path: classify_counts() first, then
- * return has_new_bits(). */
+ * on rare cases it fall backs to the slow path: has_new_bits_and_classify(). */
 
 static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
                                            bool *classified) {
@@ -295,9 +391,9 @@ static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
     return 0;
 
 #endif                                                     /* ^WORD_SIZE_64 */
-  classify_counts(&afl->fsrv);
+
   *classified = true;
-  return has_new_bits(afl, virgin_map);
+  return has_new_bits_and_classify(afl, virgin_map);
 
 }
 
