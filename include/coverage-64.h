@@ -66,6 +66,47 @@ inline void classify_counts(afl_forkserver_t *fsrv) {
   u64 *mem = (u64 *)fsrv->trace_bits;
   u32  i = (fsrv->map_size >> 3);
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+
+  /* LUT for 0..15: 0->0, 1->1, 2->2, 3->4, 4-7->8, 8-15->16 */
+  /* This layout repeated 4x128 bit lanes */
+  const __m512i lut_low = _mm512_broadcast_i32x4(_mm_set_epi8(
+      16, 16, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 4, 2, 1, 0));
+
+  const __m512i v_128 = _mm512_set1_epi8(128);
+  const __m512i v_64 = _mm512_set1_epi8(64);
+  const __m512i v_32 = _mm512_set1_epi8(32);
+  const __m512i v_15 = _mm512_set1_epi8(15);
+  const __m512i v_31 = _mm512_set1_epi8(31);
+  const __m512i v_127 = _mm512_set1_epi8(127);
+
+  while (i >= 8) {
+
+    __m512i v = _mm512_loadu_si512((void *)mem);
+
+    /* Optimize for sparse bitmaps. */
+    if (_mm512_test_epi64_mask(v, v)) {
+
+      __m512i   res_low = _mm512_shuffle_epi8(lut_low, v);
+      __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(v, v_15, _MM_CMPINT_GT);
+      __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(v, v_31, _MM_CMPINT_GT);
+      __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(v, v_127, _MM_CMPINT_GT);
+
+      __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64);
+      res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128);
+
+      __m512i res = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high);
+      _mm512_storeu_si512((void *)mem, res);
+
+    }
+
+    mem += 8;
+    i -= 8;
+
+  }
+
+#endif
+
   while (i--) {
 
     /* Optimize for sparse bitmaps. */
@@ -112,9 +153,55 @@ inline void discover_word(u8 *ret, u64 *current, u64 *virgin) {
 
 }
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+
+inline void discover_word_512(u8 *ret, u64 *current, u64 *virgin) {
+
+  __m512i v_cur = _mm512_loadu_si512((void *)current);
+  __m512i v_vir = _mm512_loadu_si512((void *)virgin);
+
+  if (_mm512_test_epi8_mask(v_cur, v_vir)) {
+
+    if (likely(*ret < 2)) {
+
+      __m512i   v_ff = _mm512_set1_epi8(0xFF);
+      __mmask64 m_cur_nz =
+          _mm512_test_epi8_mask(v_cur, v_cur);  // Mask of non-zero current bytes
+      __mmask64 m_vir_ff =
+          _mm512_cmpeq_epu8_mask(v_vir, v_ff);  // Mask of virgin bytes == 0xFF
+
+      if (m_cur_nz & m_vir_ff)
+        *ret = 2;
+      else
+        *ret = 1;
+
+    }
+
+    /* virgin &= ~current */
+    __m512i v_new_vir = _mm512_andnot_si512(v_cur, v_vir);
+    _mm512_storeu_si512((void *)virgin, v_new_vir);
+
+  }
+
+}
+
+#endif
+
 #if defined(__AVX512F__) && defined(__AVX512DQ__)
   #define PACK_SIZE 64
 inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
+
+#if defined(__AVX512BW__)
+  /* Constants for vector classification */
+  const __m512i lut_low = _mm512_broadcast_i32x4(_mm_set_epi8(
+      16, 16, 16, 16, 16, 16, 16, 16, 8, 8, 8, 8, 4, 2, 1, 0));
+  const __m512i v_128 = _mm512_set1_epi8(128);
+  const __m512i v_64 = _mm512_set1_epi8(64);
+  const __m512i v_32 = _mm512_set1_epi8(32);
+  const __m512i v_15 = _mm512_set1_epi8(15);
+  const __m512i v_31 = _mm512_set1_epi8(31);
+  const __m512i v_127 = _mm512_set1_epi8(127);
+#endif
 
   for (; current != current_end; virgin += 8, current += 8) {
 
@@ -124,6 +211,25 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
     /* All bytes are zero. */
     if (likely(mask == 0xff)) continue;
 
+#if defined(__AVX512BW__)
+    
+    /* Optimize the check using full vectors instead of scalar unrolling */
+    
+    /* 1. Classify the current vector (same logic as classify_counts) */
+    __m512i   res_low = _mm512_shuffle_epi8(lut_low, value);
+    __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(value, v_15, _MM_CMPINT_GT);
+    __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(value, v_31, _MM_CMPINT_GT);
+    __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(value, v_127, _MM_CMPINT_GT);
+
+    __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64);
+    res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128);
+    __m512i classified = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high);
+
+    /* 2. Load virgin map and check for any intersection */
+    __m512i virgin_vec = _mm512_loadu_si512((void *)virgin);
+    if (unlikely(_mm512_test_epi8_mask(classified, virgin_vec))) return 1;
+
+#else
         /* Look for nonzero bytes and check for new bits. */
   #define UNROLL(x)                                                            \
     if (unlikely(!(mask & (1 << x)) && classify_word(current[x]) & virgin[x])) \
@@ -138,6 +244,7 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
     UNROLL(7);
   #undef UNROLL
 
+#endif
   }
 
   return 0;

@@ -235,6 +235,23 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
 #endif                                                     /* ^WORD_SIZE_64 */
 
   u8 ret = 0;
+
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(WORD_SIZE_64)
+
+  /* The map size is usually a multiple of 8, but for AVX-512 it should ideally 
+     loop by 8 words (64 bytes). We process chunks of 8 words. */
+  
+  while (i >= 8) {
+
+    discover_word_512(&ret, current, virgin);
+    current += 8;
+    virgin += 8;
+    i -= 8;
+
+  }
+
+#endif
+
   while (i--) {
 
     if (unlikely(*current)) discover_word(&ret, current, virgin);
