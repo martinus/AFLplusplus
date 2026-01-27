@@ -241,6 +241,19 @@ inline u8 has_new_bits(afl_state_t *afl, u8 *virgin_map) {
   /* The map size is usually a multiple of 8, but for AVX-512 it should ideally 
      loop by 8 words (64 bytes). We process chunks of 8 words. */
   
+  while (i >= 32) {
+
+    discover_word_512(&ret, current + 0, virgin + 0);
+    discover_word_512(&ret, current + 8, virgin + 8);
+    discover_word_512(&ret, current + 16, virgin + 16);
+    discover_word_512(&ret, current + 24, virgin + 24);
+    
+    current += 32;
+    virgin += 32;
+    i -= 32;
+
+  }
+
   while (i >= 8) {
 
     discover_word_512(&ret, current, virgin);
@@ -305,43 +318,50 @@ static inline u8 has_new_bits_and_classify(afl_state_t *afl, u8 *virgin_map) {
   const __m512i v_127 = _mm512_set1_epi8(127);
   const __m512i v_ff = _mm512_set1_epi8(0xFF);
 
+  #define CLASSIFY_BLOCK(offset) \
+    do { \
+      __m512i v = _mm512_loadu_si512((void *)(current + (offset))); \
+      if (_mm512_test_epi64_mask(v, v)) { \
+        __m512i   res_low = _mm512_shuffle_epi8(lut_low, v); \
+        __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(v, v_15, _MM_CMPINT_GT); \
+        __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(v, v_31, _MM_CMPINT_GT); \
+        __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(v, v_127, _MM_CMPINT_GT); \
+        __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64); \
+        res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128); \
+        __m512i classified = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high); \
+        _mm512_storeu_si512((void *)(current + (offset)), classified); \
+        __m512i v_vir = _mm512_loadu_si512((void *)(virgin + (offset))); \
+        if (_mm512_test_epi8_mask(classified, v_vir)) { \
+            if (likely(ret < 2)) { \
+                 __mmask64 m_cur_nz = _mm512_test_epi8_mask(classified, classified); \
+                 __mmask64 m_vir_ff = _mm512_cmpeq_epu8_mask(v_vir, v_ff); \
+                 if (m_cur_nz & m_vir_ff) ret = 2; \
+                 else ret = 1; \
+            } \
+            __m512i v_new_vir = _mm512_andnot_si512(classified, v_vir); \
+            _mm512_storeu_si512((void *)(virgin + (offset)), v_new_vir); \
+        } \
+      } \
+    } while (0)
+
+  while (i >= 32) {
+    CLASSIFY_BLOCK(0);
+    CLASSIFY_BLOCK(8);
+    CLASSIFY_BLOCK(16);
+    CLASSIFY_BLOCK(24);
+    current += 32;
+    virgin += 32;
+    i -= 32;
+  }
+
   while (i >= 8) {
-
-    __m512i v = _mm512_loadu_si512((void *)current);
-
-    /* Optimize for sparse bitmaps. */
-    if (_mm512_test_epi64_mask(v, v)) {
-
-      __m512i   res_low = _mm512_shuffle_epi8(lut_low, v);
-      __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(v, v_15, _MM_CMPINT_GT);
-      __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(v, v_31, _MM_CMPINT_GT);
-      __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(v, v_127, _MM_CMPINT_GT);
-
-      __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64);
-      res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128);
-      __m512i classified = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high);
-
-      _mm512_storeu_si512((void *)current, classified);
-      
-      __m512i v_vir = _mm512_loadu_si512((void *)virgin);
-      if (_mm512_test_epi8_mask(classified, v_vir)) {
-          if (likely(ret < 2)) {
-               __mmask64 m_cur_nz = _mm512_test_epi8_mask(classified, classified);
-               __mmask64 m_vir_ff = _mm512_cmpeq_epu8_mask(v_vir, v_ff);
-               if (m_cur_nz & m_vir_ff) ret = 2;
-               else ret = 1;
-          }
-          __m512i v_new_vir = _mm512_andnot_si512(classified, v_vir);
-          _mm512_storeu_si512((void *)virgin, v_new_vir);
-      }
-
-    }
-
+    CLASSIFY_BLOCK(0);
     current += 8;
     virgin += 8;
     i -= 8;
-
   }
+  
+  #undef CLASSIFY_BLOCK
 
 #endif
 
