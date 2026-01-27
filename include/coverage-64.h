@@ -158,6 +158,9 @@ inline void discover_word(u8 *ret, u64 *current, u64 *virgin) {
 inline void discover_word_512(u8 *ret, u64 *current, u64 *virgin) {
 
   __m512i v_cur = _mm512_loadu_si512((void *)current);
+
+  if (likely(_mm512_test_epi8_mask(v_cur, v_cur) == 0)) return;
+
   __m512i v_vir = _mm512_loadu_si512((void *)virgin);
 
   if (_mm512_test_epi8_mask(v_cur, v_vir)) {
@@ -201,9 +204,48 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
   const __m512i v_15 = _mm512_set1_epi8(15);
   const __m512i v_31 = _mm512_set1_epi8(31);
   const __m512i v_127 = _mm512_set1_epi8(127);
-#endif
+  
+  #define CHECK_BLOCK(offset) \
+      do { \
+        __m512i  val = _mm512_loadu_si512((void *)(current + (offset))); \
+        if (unlikely(_mm512_test_epi8_mask(val, val))) { /* Not zero */ \
+           __m512i vir = _mm512_loadu_si512((void *)(virgin + (offset))); \
+           if (likely(_mm512_test_epi8_mask(vir, vir))) { /* Virgin not zero */ \
+              /* Classify */ \
+              __m512i r_l = _mm512_shuffle_epi8(lut_low, val); \
+              __mmask64 m16 = _mm512_cmp_epu8_mask(val, v_15, _MM_CMPINT_GT); \
+              __mmask64 m32 = _mm512_cmp_epu8_mask(val, v_31, _MM_CMPINT_GT); \
+              __mmask64 m128 = _mm512_cmp_epu8_mask(val, v_127, _MM_CMPINT_GT); \
+              __m512i r_h = _mm512_mask_blend_epi8(m32, v_32, v_64); \
+              r_h = _mm512_mask_blend_epi8(m128, r_h, v_128); \
+              __m512i cls = _mm512_mask_blend_epi8(m16, r_l, r_h); \
+              if (unlikely(_mm512_test_epi8_mask(cls, vir))) return 1; \
+           } \
+        } \
+      } while (0)
 
-  for (; current != current_end; virgin += 8, current += 8) {
+  while (current + 32 <= current_end) {
+    CHECK_BLOCK(0);
+    CHECK_BLOCK(8);
+    CHECK_BLOCK(16);
+    CHECK_BLOCK(24);
+    current += 32;
+    virgin += 32;
+  }
+
+  while (current < current_end) {
+    CHECK_BLOCK(0);
+    current += 8;
+    virgin += 8;
+  }
+  
+  #undef CHECK_BLOCK
+  
+  return 0;
+
+#else
+
+  for (; current < current_end; virgin += 8, current += 8) {
 
     __m512i  value = *(__m512i *)current;
     __mmask8 mask = _mm512_testn_epi64_mask(value, value);
@@ -211,25 +253,6 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
     /* All bytes are zero. */
     if (likely(mask == 0xff)) continue;
 
-#if defined(__AVX512BW__)
-    
-    /* Optimize the check using full vectors instead of scalar unrolling */
-    
-    /* 1. Classify the current vector (same logic as classify_counts) */
-    __m512i   res_low = _mm512_shuffle_epi8(lut_low, value);
-    __mmask64 m_ge_16 = _mm512_cmp_epu8_mask(value, v_15, _MM_CMPINT_GT);
-    __mmask64 m_ge_32 = _mm512_cmp_epu8_mask(value, v_31, _MM_CMPINT_GT);
-    __mmask64 m_ge_128 = _mm512_cmp_epu8_mask(value, v_127, _MM_CMPINT_GT);
-
-    __m512i res_high = _mm512_mask_blend_epi8(m_ge_32, v_32, v_64);
-    res_high = _mm512_mask_blend_epi8(m_ge_128, res_high, v_128);
-    __m512i classified = _mm512_mask_blend_epi8(m_ge_16, res_low, res_high);
-
-    /* 2. Load virgin map and check for any intersection */
-    __m512i virgin_vec = _mm512_loadu_si512((void *)virgin);
-    if (unlikely(_mm512_test_epi8_mask(classified, virgin_vec))) return 1;
-
-#else
         /* Look for nonzero bytes and check for new bits. */
   #define UNROLL(x)                                                            \
     if (unlikely(!(mask & (1 << x)) && classify_word(current[x]) & virgin[x])) \
@@ -244,10 +267,10 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
     UNROLL(7);
   #undef UNROLL
 
-#endif
   }
 
   return 0;
+#endif
 
 }
 
