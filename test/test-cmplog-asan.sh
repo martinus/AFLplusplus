@@ -1,5 +1,6 @@
 #!/bin/bash
-# Regression test: the CmpLog routine hooks must not trigger an ASan report.
+# Regression test: the CmpLog and value-profile routine hooks must not trigger
+# an ASan report.
 #
 # __asan_region_is_poisoned(ptr, len) does not see a poisoned byte at the end
 # of a partial 8-byte granule when the next granule is addressable. The hooks
@@ -28,6 +29,7 @@ cat > "$TEMP_DIR/cmplog-asan.c" << 'EOF'
 
 #include "types.h"
 #include "cmplog.h"
+#include "value-profile.h"
 
 #ifndef MAP_ANONYMOUS
   #define MAP_ANONYMOUS MAP_ANON
@@ -36,9 +38,15 @@ cat > "$TEMP_DIR/cmplog-asan.c" << 'EOF'
 extern struct cmp_map *__afl_cmp_map;
 void                   __cmplog_rtn_hook(u8 *ptr1, u8 *ptr2);
 void                   __cmplog_rtn_hook_str(u8 *ptr1, u8 *ptr2);
+extern vp_map_t       *__afl_vp_map;
+void __valueprofile_rtn_hook_str(u8 *ptr1, u8 *ptr2, u64 site_token);
+void __valueprofile_rtn_hook_sub(u8 *hay, u8 *needle, u64 site_token);
 
 static char buf_rtn[64] __attribute__((aligned(8)));
 static char buf_str[64] __attribute__((aligned(8)));
+/* Value profile checks 32 bytes of both operands, so no short literals. */
+static char vp_str[64] = "AAB";
+static char vp_sub[64] = "AA";
 
 static int has_operand(const struct cmp_map *cmp_map, const char *value,
                        u32 v0_len) {
@@ -82,14 +90,14 @@ int main(void) {
   if (__asan_region_is_poisoned(buf_rtn + 28, 32)) return 3;
   if (!__asan_region_is_poisoned(buf_rtn + 28, 4)) return 3;
 
-  /* Only 4 bytes are readable before an unmapped page, so the generic hook
+  /* Only 4 bytes are readable before a PROT_NONE page, so the generic hook
      copies 4 bytes of the other operand: bytes 28..31. */
   long page_size = sysconf(_SC_PAGESIZE);
   if (page_size <= 0) return 4;
   char *map = mmap(NULL, (size_t)page_size * 2U, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (map == MAP_FAILED) return 4;
-  if (munmap(map + page_size, (size_t)page_size) != 0) return 4;
+  if (mprotect(map + page_size, (size_t)page_size, PROT_NONE) != 0) return 4;
   char *tail = map + page_size - 4;
   memcpy(tail, "BBBB", 4);
 
@@ -100,7 +108,18 @@ int main(void) {
   __cmplog_rtn_hook_str((u8 *)buf_str + 28, (u8 *)"AAB");
   if (!has_operand(cmp_map, "AAA", 0x80 + 4)) return 6;
 
-  munmap(map, (size_t)page_size);
+  /* The value-profile string hooks measure the same operand with strnlen. */
+  vp_map_t *vp_map = calloc(1, sizeof(vp_map_t));
+  if (!vp_map) return 7;
+  vp_map->enabled = 1;
+  vp_map->exec_id = 1;
+  __afl_vp_map = vp_map;
+  __valueprofile_rtn_hook_str((u8 *)buf_str + 28, (u8 *)vp_str, 1);
+  __valueprofile_rtn_hook_sub((u8 *)buf_str + 28, (u8 *)vp_sub, 1);
+  __afl_vp_map = NULL;
+
+  munmap(map, (size_t)page_size * 2U);
+  free(vp_map);
   free(cmp_map);
   return 0;
 

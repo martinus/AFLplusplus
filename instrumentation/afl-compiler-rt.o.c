@@ -218,8 +218,9 @@ static FORCEINLINE NOASAN void *memset_noasan(void *dst, int c, size_t n) {
 /* Byte loops for reading target memory in the comparison hooks. A libc call
    would go to the ASan interceptor, which aborts on poisoned bytes that
    __asan_region_is_poisoned() can miss (the poisoned tail of a partial granule
-   followed by an addressable granule). volatile stops the compiler from
-   turning the loops back into libc calls. */
+   followed by an addressable granule). The protection is that no libc call is
+   made: volatile stops the compiler from turning the loops back into one.
+   NOASAN only matters if this file is itself built with ASan. */
 static FORCEINLINE NOASAN void memcpy_noasan(void *dst, const void *src,
                                              size_t n) {
 

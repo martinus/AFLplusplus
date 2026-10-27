@@ -13,6 +13,11 @@
     - a plain `-fcf-protection` (part of the default hardened CFLAGS on
       Fedora/RHEL) was mistaken for `AFL_USE_CFISAN` and injected `-flto`,
       which silently disabled PCGUARD instrumentation for the target
+  - instrumentation
+    - CmpLog and value-profile routine hooks no longer trigger an ASan
+      "unknown-crash" report on operands next to a partly poisoned 8-byte
+      granule. This killed the CmpLog forkserver at startup of some C++
+      targets built with ASan.
 
 
 ### Version ++5.03c (release)
