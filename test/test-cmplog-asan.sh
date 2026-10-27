@@ -22,12 +22,10 @@ trap cleanup EXIT
 
 cat > "$TEMP_DIR/cmplog-asan.c" << 'EOF'
 #include <sanitizer/asan_interface.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-#include "types.h"
 #include "cmplog.h"
 #include "value-profile.h"
 
@@ -42,7 +40,9 @@ extern vp_map_t       *__afl_vp_map;
 void __valueprofile_rtn_hook_str(u8 *ptr1, u8 *ptr2, u64 site_token);
 void __valueprofile_rtn_hook_sub(u8 *hay, u8 *needle, u64 site_token);
 
-static char buf_rtn[64] __attribute__((aligned(8)));
+static struct cmp_map cmp_map;
+static vp_map_t       vp_map;
+static char           buf_rtn[64] __attribute__((aligned(8)));
 static char buf_str[64] __attribute__((aligned(8)));
 /* Value profile checks 32 bytes of both operands, so no short literals. */
 static char vp_str[64] = "AAB";
@@ -75,9 +75,7 @@ static int has_operand(const struct cmp_map *cmp_map, const char *value,
 
 int main(void) {
 
-  struct cmp_map *cmp_map = calloc(1, sizeof(struct cmp_map));
-  if (!cmp_map) return 2;
-  __afl_cmp_map = cmp_map;
+  __afl_cmp_map = &cmp_map;
 
   /* Byte 31 is poisoned, bytes 28..30 and 32.. are addressable. Operands
      start at byte 28, so a 32-byte check does not see byte 31. */
@@ -102,40 +100,38 @@ int main(void) {
   memcpy(tail, "BBBB", 4);
 
   __cmplog_rtn_hook((u8 *)buf_rtn + 28, (u8 *)tail);
-  if (!has_operand(cmp_map, "AAAZ", 4)) return 5;
+  if (!has_operand(&cmp_map, "AAAZ", 4)) return 5;
 
   /* The string hook stops at the NUL in byte 31: "AAA" plus NUL. */
   __cmplog_rtn_hook_str((u8 *)buf_str + 28, (u8 *)"AAB");
-  if (!has_operand(cmp_map, "AAA", 0x80 + 4)) return 6;
+  if (!has_operand(&cmp_map, "AAA", 0x80 + 4)) return 6;
 
   /* The value-profile string hooks measure the same operand with strnlen. */
-  vp_map_t *vp_map = calloc(1, sizeof(vp_map_t));
-  if (!vp_map) return 7;
-  vp_map->enabled = 1;
-  vp_map->exec_id = 1;
-  __afl_vp_map = vp_map;
+  vp_map.enabled = 1;
+  vp_map.exec_id = 1;
+  __afl_vp_map = &vp_map;
   __valueprofile_rtn_hook_str((u8 *)buf_str + 28, (u8 *)vp_str, 1);
   __valueprofile_rtn_hook_sub((u8 *)buf_str + 28, (u8 *)vp_sub, 1);
-  __afl_vp_map = NULL;
-
-  munmap(map, (size_t)page_size * 2U);
-  free(vp_map);
-  free(cmp_map);
   return 0;
 
 }
 EOF
 
-echo 'int main(void) { return 0; }' > "$TEMP_DIR/probe.c"
 if ! AFL_QUIET=1 "$AFL_DIR/afl-clang-fast" -fsanitize=address \
-    -o "$TEMP_DIR/probe" "$TEMP_DIR/probe.c" > /dev/null 2>&1; then
+    -I"$AFL_DIR/include" -o "$TEMP_DIR/cmplog-asan" "$TEMP_DIR/cmplog-asan.c"; then
 
-  echo "SKIP: afl-clang-fast cannot build with -fsanitize=address"
-  exit 0
+  # Skip only if the toolchain cannot build any ASan program.
+  echo 'int main(void) { return 0; }' > "$TEMP_DIR/probe.c"
+  if ! AFL_QUIET=1 "$AFL_DIR/afl-clang-fast" -fsanitize=address \
+      -o "$TEMP_DIR/probe" "$TEMP_DIR/probe.c" > /dev/null 2>&1; then
+
+    echo "SKIP: afl-clang-fast cannot build with -fsanitize=address"
+    exit 0
+
+  fi
+
+  exit 1
 
 fi
 
-AFL_QUIET=1 "$AFL_DIR/afl-clang-fast" -fsanitize=address -I"$AFL_DIR/include" \
-  -o "$TEMP_DIR/cmplog-asan" "$TEMP_DIR/cmplog-asan.c" || exit 1
-
-ASAN_OPTIONS=detect_leaks=0:abort_on_error=0 "$TEMP_DIR/cmplog-asan"
+ASAN_OPTIONS=detect_leaks=0 "$TEMP_DIR/cmplog-asan"
