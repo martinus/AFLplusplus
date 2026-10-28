@@ -338,11 +338,15 @@ test -e ../afl-clang-fast -a -e ../split-switches-pass.so && {
   }
   # Test the cmplog readability probe (pipe sink, errno, readable prefix)
   test -e test-cmplog-probe.sh && {
-    ./test-cmplog-probe.sh > /dev/null 2>&1 && {
-      $ECHO "$GREEN[+] cmplog readability probe test passed"
+    test "$OS" = "Linux" && {
+      ./test-cmplog-probe.sh > /dev/null 2>&1 && {
+        $ECHO "$GREEN[+] cmplog readability probe test passed"
+      } || {
+        $ECHO "$RED[!] cmplog readability probe test failed"
+        CODE=1
+      }
     } || {
-      $ECHO "$RED[!] cmplog readability probe test failed"
-      CODE=1
+      $ECHO "$YELLOW[-] cmplog readability probe test is Linux only, skipped"
     }
   }
   # Test cmplog instructions pass with non-standard integer sizes (issue #2704)

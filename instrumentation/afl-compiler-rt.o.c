@@ -1019,6 +1019,10 @@ static void __afl_open_dummy_fd(void) {
   if (pipe(__afl_dummy_fd) < 0) {
 
     __afl_dummy_fd[0] = __afl_dummy_fd[1] = -1;
+  #ifdef __linux__
+    /* Slower, but it faults correctly. */
+    __afl_dummy_fd[1] = open("/dev/urandom", O_WRONLY);
+  #endif
 
   } else {
 
@@ -4534,7 +4538,7 @@ __attribute__((weak)) void *__asan_region_is_poisoned(void *beg, size_t size);
 static void __afl_drain_dummy_fd(void) {
 
   if (__afl_dummy_fd[0] < 0) { return; }
-  u8 buf[4096];
+  u8 buf[256];
   while (read(__afl_dummy_fd[0], buf, sizeof(buf)) > 0) {}
 
 }
@@ -4604,9 +4608,16 @@ static int area_is_valid(void *ptr, size_t len) {
 #elif defined(__linux__)
   /* A pipe write fails as a whole if any byte faults. Faults happen per page,
      so probe up to the page end first to find the readable prefix. */
-  size_t page_size = (size_t)sysconf(_SC_PAGE_SIZE);
-  size_t first = MIN(len, page_size - ((uintptr_t)ptr & (page_size - 1)));
-  long   r = __afl_probe_write(ptr, first);
+  long   page_size = sysconf(_SC_PAGE_SIZE);
+  size_t first = len;
+  if (likely(page_size > 0)) {
+
+    size_t offset = (uintptr_t)ptr & ((size_t)page_size - 1U);
+    first = MIN(len, (size_t)page_size - offset);
+
+  }
+
+  long r = __afl_probe_write(ptr, first);
   if (r == (long)first && first < len) {
 
     long r2 = __afl_probe_write((u8 *)ptr + first, len - first);
