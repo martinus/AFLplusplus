@@ -126,6 +126,10 @@ static inline void afl_sync_wake(void *uaddr) {
   #include <sys/uio.h>
   #define AFL_HAVE_RAW_WRITEV 1
 #endif
+#if (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
+  /* The readability probes write to a pipe (see __afl_open_dummy_fd). */
+  #define AFL_PROBE_PIPE 1
+#endif
 #ifndef USEMMAP
   #include <sys/shm.h>
 #endif
@@ -994,11 +998,11 @@ static void __afl_bug_bind_map(void) {
    work: the kernel never reads the source buffer, so the probe would report
    unmapped memory as valid - which is also why there is no fallback to the
    target's own stdout or stderr, whose sink the target does not control and
-   which afl-fuzz points at /dev/null. The pipe fallback is set non-blocking
-   because nothing ever drains it: once the 64K buffer is full the probes fail
-   closed and stop collecting instead of blocking the target forever. Runs at
-   most once - until it does, the descriptor stays -1 and the probes fail
-   closed. */
+   which afl-fuzz points at /dev/null. On other platforms the pipe fallback is
+   set non-blocking because nothing ever drains it: once the 64K buffer is full
+   the probes fail closed and stop collecting instead of blocking the target
+   forever. Runs at most once - until it does, the descriptor stays -1 and the
+   probes fail closed. */
 static void __afl_open_dummy_fd(void) {
 
   static u8 attempted = 0;
@@ -1006,16 +1010,13 @@ static void __afl_open_dummy_fd(void) {
   if (attempted) { return; }
   attempted = 1;
 
-#if (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
-  /* The readability probe (area_is_valid) writes the tested bytes to this fd so
-     the kernel faults on unmapped source pages. write() to /dev/null never
-     faults (it reports success for unmapped memory). On macOS write() to
-     /dev/urandom always returns -1. On Linux it works, but the kernel mixes
-     every byte into the entropy pool under a global lock, which makes the
-     probes slow and serializes parallel fuzzer instances. A pipe faults
-     correctly and is cheap, so use it. Set both ends non-blocking so that once
-     the 64 KiB buffer fills the read end can be drained and the write retried
-     instead of blocking (see area_is_valid / __afl_drain_dummy_fd). */
+#ifdef AFL_PROBE_PIPE
+  /* On macOS write() to /dev/urandom always returns -1. On Linux it works, but
+     the kernel mixes every byte into the entropy pool under a global lock,
+     which is slow and serializes parallel fuzzer instances. A pipe faults
+     correctly and is cheap. Set both ends non-blocking so that once the 64 KiB
+     buffer fills the read end can be drained and the write retried instead of
+     blocking (see __afl_drain_dummy_fd). */
   if (pipe(__afl_dummy_fd) < 0) {
 
     __afl_dummy_fd[0] = __afl_dummy_fd[1] = -1;
@@ -4532,13 +4533,14 @@ __attribute__((weak_import)) void *__asan_region_is_poisoned(void  *beg,
 __attribute__((weak)) void *__asan_region_is_poisoned(void *beg, size_t size);
 #endif
 
-#if (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
+#ifdef AFL_PROBE_PIPE
 /* Empty the probe pipe (see __afl_open_dummy_fd). Both ends are non-blocking,
-   so the read loop stops at EAGAIN once the buffer is drained. */
+   so the read loop stops at EAGAIN once the buffer is drained. The contents
+   are thrown away; the buffer is static to keep the target's stack small. */
 static void __afl_drain_dummy_fd(void) {
 
   if (__afl_dummy_fd[0] < 0) { return; }
-  u8 buf[256];
+  static u8 buf[4096];
   while (read(__afl_dummy_fd[0], buf, sizeof(buf)) > 0) {}
 
 }
@@ -4565,6 +4567,17 @@ static long __afl_probe_write(void *ptr, size_t len) {
 }
 
 #endif
+
+/* Number of bytes from ptr to the end of its page, at most len. 0 if the page
+   size is unknown. A fault always starts at a page boundary. */
+static inline size_t __afl_page_prefix(void *ptr, size_t len) {
+
+  long page_size = sysconf(_SC_PAGE_SIZE);
+  if (unlikely(page_size <= 0)) { return 0; }
+  size_t offset = (uintptr_t)ptr & ((size_t)page_size - 1U);
+  return MIN(len, (size_t)page_size - offset);
+
+}
 
 // POSIX shenanigan to see if an area is mapped.
 // If it is mapped as X-only, we have a problem, so maybe we should add a check
@@ -4606,17 +4619,10 @@ static int area_is_valid(void *ptr, size_t len) {
 
   #pragma GCC diagnostic pop
 #elif defined(__linux__)
-  /* A pipe write fails as a whole if any byte faults. Faults happen per page,
-     so probe up to the page end first to find the readable prefix. */
-  long   page_size = sysconf(_SC_PAGE_SIZE);
-  size_t first = len;
-  if (likely(page_size > 0)) {
-
-    size_t offset = (uintptr_t)ptr & ((size_t)page_size - 1U);
-    first = MIN(len, (size_t)page_size - offset);
-
-  }
-
+  /* A pipe write fails as a whole if any byte faults, so probe up to the page
+     end first to find the readable prefix. */
+  size_t first = __afl_page_prefix(ptr, len);
+  if (unlikely(!first)) { return 0; }
   long r = __afl_probe_write(ptr, first);
   if (r == (long)first && first < len) {
 
@@ -4656,21 +4662,17 @@ static u32 area_pair_valid_len(void *ptr1, void *ptr2, size_t len) {
 
   }
 
-  long page_size = sysconf(_SC_PAGE_SIZE);
-  if (unlikely(page_size <= 0)) return 0;
-
-  size_t page_mask = (size_t)page_size - 1U;
-  size_t len1 = MIN(len, (size_t)page_size - ((uintptr_t)ptr1 & page_mask));
-  size_t len2 = MIN(len, (size_t)page_size - ((uintptr_t)ptr2 & page_mask));
+  size_t len1 = __afl_page_prefix(ptr1, len);
+  size_t len2 = __afl_page_prefix(ptr2, len);
+  if (unlikely(!len1 || !len2)) return 0;
   struct iovec iov[2] = {{ptr1, len1}, {ptr2, len2}};
 
-  #if defined(__APPLE__) && defined(__MACH__)
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-  #endif
+  /* syscall(2) is deprecated on macOS, see area_is_valid. */
+  #pragma GCC diagnostic push
+  #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
   int  saved_errno = errno;
   long r = syscall(SYS_writev, __afl_dummy_fd[1], iov, 2);
-  #if (defined(__APPLE__) && defined(__MACH__)) || defined(__linux__)
+  #ifdef AFL_PROBE_PIPE
   if (unlikely(r < 0 && errno == EAGAIN)) {
 
     /* probe pipe buffer is full; drain it and retry the fault probe once */
@@ -4680,9 +4682,7 @@ static u32 area_pair_valid_len(void *ptr1, void *ptr2, size_t len) {
   }
 
   #endif
-  #if defined(__APPLE__) && defined(__MACH__)
-    #pragma GCC diagnostic pop
-  #endif
+  #pragma GCC diagnostic pop
   errno = saved_errno;
 
   if (unlikely(r != (long)(len1 + len2))) return 0;
