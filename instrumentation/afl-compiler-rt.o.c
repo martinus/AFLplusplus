@@ -593,6 +593,75 @@ u32 __afl_already_initialized_init;
 
 static int __afl_dummy_fd[2] = {-1, -1};
 
+/* Cache of 4 KiB blocks that a CmpLog readability probe found readable, so
+   that probes on hot heap and stack pages need no syscall. Pages are at least
+   4 KiB, so each block is inside one page. An entry is the block address with
+   bit 0 set, so an empty entry (0) never matches, not even for block 0.
+   Threads can race on an entry, but a lost or overwritten store can only
+   cause an extra syscall. The cache is cleared when the fork server starts
+   and in each __afl_persistent_loop() call, so each run starts empty.
+
+   Only a range inside one block can hit. A range that crosses a block always
+   gets the syscall, so a read window at the end of a valid buffer can never
+   reach into a next page that was unmapped. A false hit needs a pointer into
+   a page that the target unmaps or protects during the same run, for example
+   a dangling pointer. Only the CmpLog hooks use the cache: in a CmpLog run a
+   false hit only loses the CmpLog data, but during static initialization it
+   stops the CmpLog fork server. */
+#define AFL_PROBE_CACHE_BITS 10
+#define AFL_PROBE_BLOCK ((uintptr_t)4096)
+static uintptr_t __afl_probe_cache[1 << AFL_PROBE_CACHE_BITS];
+
+/* Multiplicative hash of the block number. Plain low bits collide often:
+   ASan keeps each size class in a region aligned to a large power of 2. */
+static inline uintptr_t *__afl_probe_cache_slot(uintptr_t b) {
+
+  u64 h = (u64)(b / AFL_PROBE_BLOCK) * 0x9E3779B97F4A7C15ULL;
+  return &__afl_probe_cache[h >> (64 - AFL_PROBE_CACHE_BITS)];
+
+}
+
+/* The block of [ptr, ptr + len) as cache entry, 0 if the range is empty or
+   is not inside one block. */
+static inline uintptr_t __afl_probe_cache_entry(void *ptr, size_t len) {
+
+  uintptr_t b = (uintptr_t)ptr & ~(AFL_PROBE_BLOCK - 1);
+  uintptr_t last = ((uintptr_t)ptr + len - 1) & ~(AFL_PROBE_BLOCK - 1);
+  if (unlikely(!len || last != b)) { return 0; }
+  return b | 1;
+
+}
+
+static inline int __afl_probe_cache_hit(void *ptr, size_t len) {
+
+  uintptr_t entry = __afl_probe_cache_entry(ptr, len);
+  return entry && __atomic_load_n(__afl_probe_cache_slot(entry),
+                                  __ATOMIC_RELAXED) == entry;
+
+}
+
+static inline void __afl_probe_cache_add(void *ptr, size_t len) {
+
+  uintptr_t entry = __afl_probe_cache_entry(ptr, len);
+  if (entry) {
+
+    __atomic_store_n(__afl_probe_cache_slot(entry), entry, __ATOMIC_RELAXED);
+
+  }
+
+}
+
+static inline void __afl_probe_cache_clear(void) {
+
+  /* __afl_coverage_off() sets __afl_cmp_map to NULL, only the backup stays */
+  if (unlikely(__afl_cmp_map || __afl_cmp_map_backup)) {
+
+    memset_noasan(__afl_probe_cache, 0, sizeof(__afl_probe_cache));
+
+  }
+
+}
+
 #ifdef __linux__
 static u8 addr_table_prepare(void);
 #endif
@@ -1908,6 +1977,9 @@ static void __afl_start_forkserver(void) {
   if (__afl_cmp_map) { addr_table_prepare(); }
 #endif
 
+  /* The children inherit an empty probe cache. */
+  __afl_probe_cache_clear();
+
   struct sigaction orig_action;
   sigaction(SIGTERM, NULL, &orig_action);
   old_sigterm_handler = orig_action.sa_handler;
@@ -2358,6 +2430,8 @@ int __afl_persistent_loop(unsigned int max_cnt) {
 #ifdef AFL_PERSISTENT_RECORD
   char tcase[PATH_MAX];
 #endif
+
+  __afl_probe_cache_clear();
 
   if (unlikely(first_pass)) {
 
@@ -4980,7 +5054,12 @@ static u8 get_prog_addr_attr(const void *addr) {
 static inline int cmplog_area_is_valid(void *ptr, size_t len, u8 *attr) {
 
   *attr = ADDR_ATTR_NOTFOUND;
-  if (unlikely(!ptr)) { return 0; }
+  if (unlikely(!ptr || (__asan_region_is_poisoned &&
+                        __asan_region_is_poisoned(ptr, len)))) {
+
+    return 0;
+
+  }
 
   if (__afl_fuzz_ptr) {
 
@@ -4991,13 +5070,6 @@ static inline int cmplog_area_is_valid(void *ptr, size_t len, u8 *attr) {
 
       size_t offset = addr - base;
       if (len > fuzz_len - offset) { return 0; }
-      if (unlikely(__asan_region_is_poisoned &&
-                   __asan_region_is_poisoned(ptr, len))) {
-
-        return 0;
-
-      }
-
       return (int)len;
 
     }
@@ -5007,25 +5079,17 @@ static inline int cmplog_area_is_valid(void *ptr, size_t len, u8 *attr) {
 #ifdef AFL_HAVE_ADDR_ATTR
   #ifdef __linux__
   size_t valid_len = get_prog_addr_info(ptr, len, attr);
-  if (valid_len == len) {
-
-    if (unlikely(__asan_region_is_poisoned &&
-                 __asan_region_is_poisoned(ptr, len))) {
-
-      return 0;
-
-    }
-
-    return (int)valid_len;
-
-  }
+  if (valid_len == len) { return (int)valid_len; }
 
   #else
   *attr = get_prog_addr_attr(ptr);
   #endif
 #endif
 
-  return area_is_valid(ptr, len);
+  if (__afl_probe_cache_hit(ptr, len)) { return (int)len; }
+  int valid = area_is_valid(ptr, len);
+  if (valid > 0) { __afl_probe_cache_add(ptr, (size_t)valid); }
+  return valid;
 
 }
 
