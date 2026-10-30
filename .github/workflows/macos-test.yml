@@ -1,0 +1,48 @@
+# Temporary: runs only the macOS job of ci.yml on pushes to this branch.
+# Remove this file before the upstream PR.
+name: macOS test
+
+on:
+  push:
+    branches:
+      - ci-macos-llvm
+  workflow_dispatch:
+
+jobs:
+  macos:
+    runs-on: macOS-latest
+    env:
+      AFL_MAP_SIZE: 65536
+      AFL_SKIP_CPUFREQ: 1
+      AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: 1
+    steps:
+      - uses: actions/checkout@v7
+      - name: install
+        run: brew install make gcc llvm coreutils
+#     - name: fix install
+#       run: cd /usr/local/bin; ln -s gcc-12 gcc; ln -s g++-12 g++; which gcc; gcc -v
+#      - name: build
+#        run: export PATH=/usr/local/Cellar/llvm/*/":$PATH"; export CC=/usr/local/Cellar/llvm/*/bin/clang; export CXX="$CC"++; export LLVM_CONFIG=/usr/local/Cellar/llvm/*/bin/llvm-config; sudo -E ./afl-system-config; gmake ASAN_BUILD=1 afl-fuzz
+      - name: build
+        run: sudo -E ./afl-system-config; gmake ASAN_BUILD=1 afl-fuzz
+      - name: build llvm mode
+        # compiles the LLVM passes and the runtime (afl-compiler-rt.o.c) with
+        # the brew LLVM; brew is in /opt/homebrew on arm64, /usr/local on x86_64
+        run: |
+          export HOMEBREW_BASE="$(brew --prefix)/opt"
+          export PATH="$HOMEBREW_BASE/coreutils/libexec/gnubin:$HOMEBREW_BASE/llvm/bin:$PATH"
+          export CC=clang CXX=clang++ LLVM_CONFIG="$HOMEBREW_BASE/llvm/bin/llvm-config"
+          gmake -f GNUmakefile.llvm
+      - name: cmplog smoke test
+        run: |
+          export AFL_PATH="$PWD" AFL_NO_UI=1
+          AFL_LLVM_CMPLOG=1 ./afl-clang-fast -o test-instr-cmplog test-instr.c
+          mkdir -p in && echo 1 > in/a
+          ./afl-fuzz -i in -o out -V 10 -c 0 -- ./test-instr-cmplog
+#     - name: frida
+#       run: export CC=/usr/local/Cellar/llvm/*/bin/clang; export CXX="$CC"++; cd frida_mode; gmake
+#     - name: run tests
+#       run: sudo -E ./afl-system-config; export CC=/usr/local/Cellar/llvm/*/bin/clang; export CXX="$CC"++; export PATH=/usr/local/Cellar/llvm/*/":/usr/local/bin:$PATH"; export LLVM_CONFIG=/usr/local/Cellar/llvm/*/bin/llvm-config; gmake tests
+#     - name: force frida test for MacOS
+#       run: export AFL_PATH=`pwd`; /usr/local/bin/gcc -o test-instr test-instr.c; mkdir in; echo > in/in; AFL_NO_UI=1 ./afl-fuzz -O -i in -o out -V 5 -- ./test-instr
+
