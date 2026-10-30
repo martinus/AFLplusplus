@@ -163,7 +163,8 @@ jobs:
 #      - name: build
 #        run: export PATH=/usr/local/Cellar/llvm/*/":$PATH"; export CC=/usr/local/Cellar/llvm/*/bin/clang; export CXX="$CC"++; export LLVM_CONFIG=/usr/local/Cellar/llvm/*/bin/llvm-config; sudo -E ./afl-system-config; gmake ASAN_BUILD=1 afl-fuzz
       - name: build
-        run: sudo -E ./afl-system-config; gmake ASAN_BUILD=1 afl-fuzz
+        # GNUmakefile.llvm needs afl-showmap
+        run: sudo -E ./afl-system-config; gmake ASAN_BUILD=1 afl-fuzz afl-showmap
       - name: build llvm mode
         # compiles the LLVM passes and the runtime (afl-compiler-rt.o.c) with
         # the brew LLVM; brew is in /opt/homebrew on arm64, /usr/local on x86_64
