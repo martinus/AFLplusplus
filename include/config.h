@@ -562,12 +562,17 @@ We add 4 byte for one u32 length field. */
 #define MAP_SUMMARY_SHIFT 7
 #define MAP_SUMMARY_CHUNK (1U << MAP_SUMMARY_SHIFT)
 
-/* The summary starts with a header of MAP_SUMMARY_HDR bytes. One byte of the
-   header is the "stale" flag: if it is not 0, the summary does not describe
-   the map, and the fuzzer must clear or check the full map. */
+/* The summary starts with a header of MAP_SUMMARY_HDR bytes. Two bytes of the
+   header are flags:
+   - "stale": if it is not 0, the summary does not describe the map, and the
+     fuzzer must clear or check the full map.
+   - "revoked": a process of the target sets it if some of its code writes to
+     the map but does not mark the summary. The fuzzer then stops to trust the
+     marks of this target. */
 
 #define MAP_SUMMARY_HDR 64
 #define MAP_SUMMARY_HDR_STALE 0
+#define MAP_SUMMARY_HDR_REVOKED 1
 
 /* Number of summary bytes (chunks) for a map of x bytes. */
 #define MAP_SUMMARY_CHUNKS(x) \
@@ -587,6 +592,12 @@ We add 4 byte for one u32 length field. */
 #define MAP_SUMMARY_END(x)                   \
   (MAP_SUMMARY_OFFSET(x) + MAP_SUMMARY_HDR + \
    MAP_SUMMARY_ALIGN(MAP_SUMMARY_CHUNKS(x)))
+
+/* afl-fuzz gives the target the location of the summary in this environment
+   variable. The format is "offset:shift:size": the offset of the first
+   summary byte in the shared map, MAP_SUMMARY_SHIFT, and the number of
+   summary bytes. */
+#define MAP_SUMMARY_ENV_VAR "AFL_MAP_SUMMARY_SHM"
 
 /* IJON max tracking map configuration */
 

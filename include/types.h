@@ -64,7 +64,10 @@ typedef uint128_t         u128;
  * region as coverage. parameter: none */
 #define FS_NEW_OPT_BUG_MAP 0x00000010        // parameter: none
 #define FS_NEW_OPT_VALUE_PROFILE 0x00000020  // parameter: none
-#define FS_NEW_OPT_AUTODICT 0x00000800       // autodictionary data
+/* The target marks the map summary for each map byte it writes (see
+ * MAP_SUMMARY_SHIFT in config.h). parameter: none */
+#define FS_NEW_OPT_MAP_SUMMARY 0x00000040  // parameter: none
+#define FS_NEW_OPT_AUTODICT 0x00000800     // autodictionary data
 
 #if defined(__linux__) || defined(__APPLE__)
 /* Protocol phases for the futex-based forkserver handshake.

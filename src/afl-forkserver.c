@@ -538,6 +538,7 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
 
   fsrv->map_summary_enable = false;
   fsrv->map_summary_verify = false;
+  fsrv->map_summary_target = false;
 
 #if defined(__linux__) || defined(__APPLE__)
   fsrv->use_futex = false;
@@ -598,6 +599,7 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
 
   fsrv_to->map_summary_enable = from->map_summary_enable;
   fsrv_to->map_summary_verify = from->map_summary_verify;
+  fsrv_to->map_summary_target = false;
 
 #if defined(__linux__) || defined(__APPLE__)
   fsrv_to->use_futex = from->use_futex;
@@ -952,8 +954,65 @@ void nyx_load_target_hash(afl_forkserver_t *fsrv) {
    cloning a stopped child. So, we just execute once, and then send commands
    through a pipe. The other part of this logic is in afl-compilter-rt.o */
 
+static void afl_fsrv_start_target(afl_forkserver_t *fsrv, char **argv,
+                                  volatile u8 *stop_soon_p,
+                                  u8           debug_child_output);
+
+/* A process of the target can set the "revoked" flag of the map summary. It
+   does this if it writes to the map with code that does not mark the summary:
+   a module without marks that it loads late, or a helper program without
+   marks that the target starts. From then on the marks of this target are not
+   complete, so afl-fuzz scans the full map after each run, as for a target
+   without marks. */
+
+static void afl_fsrv_map_summary_check_revoked(afl_forkserver_t *fsrv) {
+
+  u8 *hdr = afl_fsrv_map_summary(fsrv);
+  if (likely(!hdr || !hdr[MAP_SUMMARY_HDR_REVOKED])) { return; }
+
+  hdr[MAP_SUMMARY_HDR_REVOKED] = 0;
+  hdr[MAP_SUMMARY_HDR_STALE] = 1;
+
+  if (fsrv->map_summary_target) {
+
+    fsrv->map_summary_target = false;
+    if (!be_quiet) {
+
+      WARNF(
+          "The target ran code that writes coverage but does not mark the map "
+          "summary. afl-fuzz now scans the full map (slower).");
+
+    }
+
+  }
+
+}
+
 void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
                     volatile u8 *stop_soon_p, u8 debug_child_output) {
+
+  /* The new target can be one that does not mark the map summary, so the
+     first run must clear the full map. The handshake sets the flag again. */
+  fsrv->map_summary_target = false;
+
+  u8 *hdr = afl_fsrv_map_summary(fsrv);
+  if (hdr) {
+
+    hdr[MAP_SUMMARY_HDR_STALE] = 1;
+    hdr[MAP_SUMMARY_HDR_REVOKED] = 0;
+
+  }
+
+  afl_fsrv_start_target(fsrv, argv, stop_soon_p, debug_child_output);
+
+  /* A target sets the flag at startup if not all of its code has marks. */
+  afl_fsrv_map_summary_check_revoked(fsrv);
+
+}
+
+static void afl_fsrv_start_target(afl_forkserver_t *fsrv, char **argv,
+                                  volatile u8 *stop_soon_p,
+                                  u8           debug_child_output) {
 
   int   st_pipe[2], ctl_pipe[2];
   u32   status;
@@ -1284,9 +1343,6 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
 #endif
 
-  /* The summary does not describe what the new target leaves in the map. */
-  afl_fsrv_map_summary_stale(fsrv);
-
   fsrv->last_run_timed_out = 0;
   fsrv->fsrv_pid = fork();
 
@@ -1449,6 +1505,24 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
       char val[16];
       snprintf(val, sizeof(val), "%u", fsrv->child_sync_offset);
       setenv("AFL_CHILD_SYNC_SHM", val, 1);
+
+    }
+
+    /* Tell the target where the map summary is. A target that marks the
+       summary answers with FS_NEW_OPT_MAP_SUMMARY. */
+    u8 *summary_hdr = afl_fsrv_map_summary(fsrv);
+
+    if (summary_hdr) {
+
+      char val[64];
+      snprintf(val, sizeof(val), "%zu:%u:%u",
+               (size_t)(summary_hdr + MAP_SUMMARY_HDR - fsrv->trace_bits),
+               (u32)MAP_SUMMARY_SHIFT, afl_fsrv_map_summary_cap(fsrv));
+      setenv(MAP_SUMMARY_ENV_VAR, val, 1);
+
+    } else {
+
+      unsetenv(MAP_SUMMARY_ENV_VAR);
 
     }
 
@@ -1702,6 +1776,20 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
         fsrv->use_value_profile = 1;
         if (!be_quiet) { ACTF("Using VALUE PROFILE feature."); }
+
+      }
+
+      if (status & FS_NEW_OPT_MAP_SUMMARY) {
+
+        if (!afl_fsrv_map_summary(fsrv)) {
+
+          FATAL(
+              "Target uses the map summary, but this tool did not offer one.");
+
+        }
+
+        fsrv->map_summary_target = true;
+        if (!be_quiet) { ACTF("Target marks the map summary."); }
 
       }
 
@@ -2698,9 +2786,9 @@ static inline void afl_fsrv_clear_map(afl_forkserver_t *fsrv) {
         if (unlikely(map[i] && !marks[i >> MAP_SUMMARY_SHIFT])) {
 
           FATAL(
-              "Map summary is wrong: map[%zu] = %u, but chunk %zu has no mark. "
-              "Please report this.",
-              i, map[i], i >> MAP_SUMMARY_SHIFT);
+              "Map summary is wrong: map[%zu] = %u, but chunk %zu has no mark "
+              "(target marks: %u). Please report this.",
+              i, map[i], i >> MAP_SUMMARY_SHIFT, fsrv->map_summary_target);
 
         }
 
@@ -2736,16 +2824,42 @@ static inline void afl_fsrv_clear_map(afl_forkserver_t *fsrv) {
 
   }
 
-  /* Nobody marks the chunks during the run. The summary is not valid until
-     somebody scans the full map and marks the chunks that are not 0. */
-  hdr[MAP_SUMMARY_HDR_STALE] = 1;
+  if (fsrv->map_summary_target) {
+
+    /* The target marks all chunks that it writes. Chunk 0 is special: the
+       runtime sets trace_bits[0], and EXEC_FAIL_SIG also goes there. */
+    hdr[MAP_SUMMARY_HDR_STALE] = 0;
+    marks[0] = 1;
+
+  } else {
+
+    /* Nobody marks the chunks during the run. The summary is not valid until
+       somebody scans the full map and marks the chunks that are not 0. */
+    hdr[MAP_SUMMARY_HDR_STALE] = 1;
+
+  }
 
 }
+
+static fsrv_run_result_t afl_fsrv_run_target_once(afl_forkserver_t *fsrv,
+                                                  u32               timeout,
+                                                  volatile u8 *stop_soon_p);
 
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update afl->fsrv->trace_bits. */
 
 fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
+    afl_forkserver_t *fsrv, u32 timeout, volatile u8 *stop_soon_p) {
+
+  fsrv_run_result_t ret = afl_fsrv_run_target_once(fsrv, timeout, stop_soon_p);
+
+  afl_fsrv_map_summary_check_revoked(fsrv);
+
+  return ret;
+
+}
+
+static inline fsrv_run_result_t afl_fsrv_run_target_once(
     afl_forkserver_t *fsrv, u32 timeout, volatile u8 *stop_soon_p) {
 
   s32 res;

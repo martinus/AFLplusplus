@@ -163,6 +163,7 @@ typedef struct afl_forkserver {
      in config.h. It tells which chunks of trace_bits can contain data. */
   bool map_summary_enable;              /* set by the tool: use the summary */
   bool map_summary_verify;              /* debug: check summary against map */
+  bool map_summary_target;              /* the target marks the summary     */
 
   bool use_ijon;                        /* use IJON tracking feature        */
   bool use_value_profile;               /* target has L1 VP runtime support */

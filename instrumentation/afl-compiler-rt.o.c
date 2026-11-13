@@ -269,7 +269,42 @@ static u8 *__afl_area_ptr_backup = __afl_area_initial;
    that the target defines itself (getenv, free, munmap, ...). So it must always
    point to a valid map: assign a new map only after it is checked, and switch
    to the dummy before the current map is released. */
-u8  *__afl_area_ptr = __afl_area_initial;
+u8 *__afl_area_ptr = __afl_area_initial;
+
+/* Map summary, see MAP_SUMMARY_SHIFT in config.h. Instrumented code does
+   __afl_map_summary_ptr[idx >> MAP_SUMMARY_SHIFT] = 1 before it changes
+   __afl_area_ptr[idx]. Without a summary from the fuzzer the pointer is a
+   sink that nobody reads. The sink has a byte for each possible idx.
+
+   The functions in this file set the mark again behind the change. The fuzzer
+   clears the marks and the map between two runs. A thread of the target that
+   runs at that time can set its mark, lose it to the fuzzer, and then change
+   the counter. The second mark repairs this.
+
+   Rules for a change of the two pointers. A mark without a counter does no
+   harm, but a counter in the shared map without a mark is lost coverage. So:
+   - instrumented code reads __afl_area_ptr first, then this pointer;
+   - the runtime sets this pointer to the summary before it sets
+     __afl_area_ptr to the shared map;
+   - the runtime sets this pointer back to the sink only when it releases the
+     shared map, after __afl_area_ptr points to the dummy map. */
+static u8  __afl_map_summary_sink_initial[MAP_SUMMARY_CHUNKS(
+    MAP_INITIAL_SIZE + MAP_SIZE_IJON_MAP + MAP_SIZE_IJON_BYTES +
+    MAP_SIZE_BUG_BYTES + 64)];
+static u8 *__afl_map_summary_sink = __afl_map_summary_sink_initial;
+static u32 __afl_map_summary_sink_size = sizeof(__afl_map_summary_sink_initial);
+u8        *__afl_map_summary_ptr = __afl_map_summary_sink_initial;
+/* Offset of the summary in the shared map, 0 if the fuzzer gave none. */
+static size_t __afl_map_summary_off = 0;
+/* Number of summary bytes that the fuzzer gave. */
+static size_t __afl_map_summary_len = 0;
+/* Set if a module marks the summary / does not mark the summary. */
+static u8        __afl_map_summary_aware = 0;
+static u8        __afl_map_summary_unaware = 0;
+static void      __afl_map_summary_reserve(u32 new_guards);
+static void      __afl_map_summary_revoke_if_incomplete(void);
+static inline u8 __afl_map_summary_complete(void);
+
 u8  *__afl_dictionary;
 u32 *__afl_child_sync = NULL;
 #if defined(__linux__) || defined(__APPLE__)
@@ -662,6 +697,8 @@ void __afl_trace(const u32 x) {
   __afl_prev_loc = (x >> 1);
 
   u8 *p = &__afl_area_ptr[prev ^ x];
+  u8 *mark = &__afl_map_summary_ptr[(prev ^ x) >> MAP_SUMMARY_SHIFT];
+  *mark = 1;
 
 #if 1                                      /* enable for neverZero feature. */
   #if __GNUC__
@@ -673,6 +710,8 @@ void __afl_trace(const u32 x) {
 #else
   ++*p;
 #endif
+
+  *(volatile u8 *)mark = 1;                    /* see __afl_map_summary_ptr */
 
   return;
 
@@ -1125,6 +1164,26 @@ static void __afl_map_shm(void) {
 
 #endif
 
+  /* The fuzzer passes the location of the map summary as
+     "offset:shift:size". Use it only if the shift is the one that the
+     instrumentation uses. */
+  __afl_map_summary_off = 0;
+  __afl_map_summary_len = 0;
+  {
+
+    char *summary = getenv(MAP_SUMMARY_ENV_VAR);
+    char *shift = summary ? strchr(summary, ':') : NULL;
+    char *len = shift ? strchr(shift + 1, ':') : NULL;
+
+    if (len && strtoul(shift + 1, NULL, 10) == MAP_SUMMARY_SHIFT) {
+
+      __afl_map_summary_off = (size_t)strtoull(summary, NULL, 10);
+      __afl_map_summary_len = (size_t)strtoull(len + 1, NULL, 10);
+
+    }
+
+  }
+
   // if we are not running in afl ensure the map exists
   if (!__afl_area_ptr) { __afl_area_ptr = __afl_area_ptr_dummy; }
   __afl_bug_configure_runtime();
@@ -1391,6 +1450,7 @@ static void __afl_map_shm(void) {
 
       u8 *old_ptr = __afl_area_ptr;
       __afl_area_ptr = __afl_area_ptr_dummy;
+      __afl_map_summary_ptr = __afl_map_summary_sink;
 
       if (__afl_map_addr) {
 
@@ -1416,6 +1476,14 @@ static void __afl_map_shm(void) {
     }
 
 #endif
+
+    /* The map summary is behind the child_sync word: map it too. */
+    if (__afl_map_summary_off &&
+        __afl_map_summary_off + __afl_map_summary_len > shm_map_len) {
+
+      shm_map_len = __afl_map_summary_off + __afl_map_summary_len;
+
+    }
 
     /* Attach into a local: the code below calls getenv(), shm_open() and
        mmap(), and __afl_area_ptr must stay valid until the map is checked. */
@@ -1527,6 +1595,17 @@ static void __afl_map_shm(void) {
 
     }
 
+    /* Summary first, then the map: see the rules at __afl_map_summary_ptr.
+       Use the summary only if it is inside the memory that is mapped
+       (__afl_shm_map_len is 0 for a SysV map, which is always complete). */
+    if (__afl_map_summary_off &&
+        (!__afl_shm_map_len ||
+         __afl_map_summary_off + __afl_map_summary_len <= __afl_shm_map_len)) {
+
+      __afl_map_summary_ptr = attached_ptr + __afl_map_summary_off;
+
+    }
+
     __afl_area_ptr = attached_ptr;
 
     /* DEFERRED IJON SETUP: Initialize on first use when actual map size is
@@ -1587,6 +1666,8 @@ static void __afl_map_shm(void) {
 
   __afl_area_ptr_backup = __afl_area_ptr;
   __afl_bug_bind_map();
+  __afl_map_summary_reserve(0);
+  __afl_map_summary_revoke_if_incomplete();
 
 #if defined(__linux__) || defined(__APPLE__)
   /* The sync word lives in the shared trace_bits map (only valid when we
@@ -1853,6 +1934,7 @@ static void __afl_unmap_shm(void) {
 
   u8 *old_ptr = __afl_area_ptr;
   __afl_area_ptr = __afl_area_ptr_dummy;
+  __afl_map_summary_ptr = __afl_map_summary_sink;
 
   if (__afl_shm_map_len) {
 
@@ -2107,6 +2189,21 @@ static void __afl_start_forkserver(void) {
 
 #endif
     if (__afl_child_sync) { status |= FS_NEW_OPT_FUTEX; }
+
+    /* Tell the fuzzer that it can trust the map summary. If the summary was
+       revoked at attach time, because the modules with marks were loaded
+       later, take that back. */
+    if (__afl_map_summary_ptr != __afl_map_summary_sink &&
+        __afl_map_summary_complete() &&
+        (size_t)__afl_map_size + sizeof(u32) + MAP_SUMMARY_HDR <=
+            __afl_map_summary_off &&
+        MAP_SUMMARY_CHUNKS(__afl_map_size) <= __afl_map_summary_len) {
+
+      status |= FS_NEW_OPT_MAP_SUMMARY;
+      (__afl_map_summary_ptr - MAP_SUMMARY_HDR)[MAP_SUMMARY_HDR_REVOKED] = 0;
+
+    }
+
     if (__afl_bug_mode & AFL_BUG_MODE_DERIVE) {
 
       status |= FS_NEW_OPT_ALLOCSIZE_DERIVE;
@@ -2705,6 +2802,8 @@ __attribute__((constructor(1))) void __afl_auto_second(void) {
   if (getenv("AFL_DISABLE_LLVM_INSTRUMENTATION")) return;
   u8 *ptr;
 
+  __afl_map_summary_reserve(0);
+
   if (__afl_final_loc > MAP_INITIAL_SIZE) {
 
     __afl_first_final_loc = __afl_final_loc + 1;
@@ -3216,10 +3315,105 @@ void __sanitizer_cov_pcs_init(const uintptr_t *pcs_beg,
    ID of 0 as a special value to indicate non-instrumented bits. That may
    still touch the bitmap, but in a fairly harmless way. */
 
-void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+/* Make sure that the sink for the map summary has a byte for each chunk of
+   the current map plus new_guards more entries. The slack covers the areas
+   that the runtime adds behind the coverage (IJON, bug map, alignment). The
+   old sink is never released, because a function that runs at this time can
+   still hold its address. */
+
+static void __afl_map_summary_reserve(u32 new_guards) {
+
+  u64 map_bytes = __afl_map_size > __afl_final_loc ? __afl_map_size
+                                                   : (u64)__afl_final_loc + 1;
+  map_bytes += (u64)new_guards + MAP_SIZE_IJON_MAP + MAP_SIZE_IJON_BYTES +
+               MAP_SIZE_BUG_BYTES + 64;
+
+  u64 need = MAP_SUMMARY_CHUNKS(map_bytes);
+  if (likely(need <= __afl_map_summary_sink_size)) { return; }
+
+  need *= 2;
+  u8 *sink = (u8 *)mmap(NULL, need, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+
+  if (sink == MAP_FAILED) {
+
+    fprintf(stderr, "Error: AFL++ could not acquire %llu bytes of memory\n",
+            (unsigned long long)need);
+    abort();
+
+  }
+
+  u8 *old = __afl_map_summary_sink;
+  __afl_map_summary_sink = sink;
+  __afl_map_summary_sink_size = (u32)need;
+  if (__afl_map_summary_ptr == old) { __afl_map_summary_ptr = sink; }
+
+}
+
+/* True if all code of this process that writes to the map also marks the
+   summary: all modules are compiled with AFL_LLVM_MAP_SUMMARY, and there is no
+   IJON and no bug map, because their code does not mark. */
+
+static inline u8 __afl_map_summary_complete(void) {
+
+  return __afl_map_summary_aware && !__afl_map_summary_unaware &&
+         !__afl_ijon_enabled && !__afl_bug_map_active;
+
+}
+
+/* If this process uses a summary from the fuzzer, but not all of its code
+   marks it, tell the fuzzer not to trust the marks (see
+   MAP_SUMMARY_HDR_REVOKED in config.h). The "stale" flag makes the fuzzer
+   scan the full map for the current run.
+
+   This is called when the map is attached and when a module registers. So it
+   also works in a process that never talks to the fuzzer, for example a
+   helper program that the target starts, and for a module that the target
+   loads after the forkserver is up. */
+
+static void __afl_map_summary_revoke_if_incomplete(void) {
+
+  if (__afl_map_summary_ptr == __afl_map_summary_sink ||
+      __afl_map_summary_complete()) {
+
+    return;
+
+  }
+
+  u8 *hdr = __afl_map_summary_ptr - MAP_SUMMARY_HDR;
+  hdr[MAP_SUMMARY_HDR_STALE] = 1;
+  hdr[MAP_SUMMARY_HDR_REVOKED] = 1;
+
+}
+
+/* A module with coverage guards registers. marks_summary says if its code
+   marks the map summary. */
+
+static void __afl_map_summary_module(u8 marks_summary) {
+
+  if (marks_summary) {
+
+    __afl_map_summary_aware = 1;
+
+  } else {
+
+    __afl_map_summary_unaware = 1;
+
+  }
+
+  __afl_map_summary_revoke_if_incomplete();
+
+}
+
+static inline __attribute__((always_inline)) void __afl_pc_guard_init(
+    uint32_t *start, uint32_t *stop, u8 marks_summary) {
 
   u32   inst_ratio = 100;
   char *x;
+
+  /* This must be before the check for a second call with the same guards:
+     a library can have modules with marks and modules without. */
+  if (start && start != stop) { __afl_map_summary_module(marks_summary); }
 
   //_is_sancov = 1;
 
@@ -3243,6 +3437,8 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
   }
 
   if (!start || start == stop || *start) { return; }
+
+  __afl_map_summary_reserve((u32)(stop - start));
 
 #ifdef __AFL_CODE_COVERAGE
   u32               *orig_start = start;
@@ -3488,6 +3684,24 @@ void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
     }
 
   }
+
+}
+
+/* Init callback of modules that do not mark the map summary. */
+
+void __sanitizer_cov_trace_pc_guard_init(uint32_t *start, uint32_t *stop) {
+
+  __afl_pc_guard_init(start, stop, 0);
+
+}
+
+/* Init callback of modules compiled with AFL_LLVM_MAP_SUMMARY. shift is the
+   MAP_SUMMARY_SHIFT that the compiler used. */
+
+void __afl_pc_guard_init_summary(uint32_t *start, uint32_t *stop,
+                                 uint32_t shift) {
+
+  __afl_pc_guard_init(start, stop, shift == MAP_SUMMARY_SHIFT);
 
 }
 
@@ -5748,7 +5962,12 @@ void __afl_coverage_skip() {
 // mark this area as especially interesting
 void __afl_coverage_interesting(u8 val, u32 id) {
 
-  __afl_area_ptr[id % __afl_map_size] = val;
+  u8 *area = __afl_area_ptr;
+  u32 idx = id % __afl_map_size;
+  u8 *mark = &__afl_map_summary_ptr[idx >> MAP_SUMMARY_SHIFT];
+  *mark = 1;
+  area[idx] = val;
+  *(volatile u8 *)mark = 1;                    /* see __afl_map_summary_ptr */
 
 }
 
