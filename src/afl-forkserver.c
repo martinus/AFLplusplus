@@ -539,6 +539,7 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
   fsrv->map_summary_enable = false;
   fsrv->map_summary_verify = false;
   fsrv->map_summary_target = false;
+  fsrv->map_summary_runs = 0;
 
 #if defined(__linux__) || defined(__APPLE__)
   fsrv->use_futex = false;
@@ -600,6 +601,7 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
   fsrv_to->map_summary_enable = from->map_summary_enable;
   fsrv_to->map_summary_verify = from->map_summary_verify;
   fsrv_to->map_summary_target = false;
+  fsrv_to->map_summary_runs = 0;
 
 #if defined(__linux__) || defined(__APPLE__)
   fsrv_to->use_futex = from->use_futex;
@@ -994,6 +996,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
   /* The new target can be one that does not mark the map summary, so the
      first run must clear the full map. The handshake sets the flag again. */
   fsrv->map_summary_target = false;
+  fsrv->map_summary_runs = 0;
 
   u8 *hdr = afl_fsrv_map_summary(fsrv);
   if (hdr) {
@@ -2841,6 +2844,70 @@ static inline void afl_fsrv_clear_map(afl_forkserver_t *fsrv) {
 
 }
 
+/* Compare the map summary of a target that marks it with the full map. A
+   chunk that is not 0 and has no mark shows that some code writes to the map
+   without marks, and that the target runtime does not know it (see
+   MAP_SUMMARY_AUDIT in config.h). Mark these chunks, so that the coverage of
+   this run is complete, and do not trust the marks of this target again. */
+
+static void afl_fsrv_map_summary_audit(afl_forkserver_t *fsrv) {
+
+  u8 *hdr = afl_fsrv_map_summary(fsrv);
+  u32 chunks = MAP_SUMMARY_CHUNKS(fsrv->map_size);
+
+  if (!hdr || hdr[MAP_SUMMARY_HDR_STALE] ||
+      chunks > afl_fsrv_map_summary_cap(fsrv)) {
+
+    return;
+
+  }
+
+  u8        *marks = hdr + MAP_SUMMARY_HDR;
+  const u64 *map = (const u64 *)fsrv->trace_bits;
+  size_t     map_words = fsrv->map_size >> 3;
+  const u32  chunk_words = MAP_SUMMARY_CHUNK >> 3;
+  u32        unmarked = 0;
+
+  for (u32 c = 0; c < chunks; ++c) {
+
+    if (marks[c]) { continue; }
+
+    size_t beg = (size_t)c * chunk_words;
+    size_t end = beg + chunk_words;
+    if (end > map_words) { end = map_words; }
+
+    u64 any = 0;
+    for (size_t i = beg; i < end; ++i) {
+
+      any |= map[i];
+
+    }
+
+    if (unlikely(any)) {
+
+      marks[c] = 1;
+      ++unmarked;
+
+    }
+
+  }
+
+  if (unlikely(unmarked)) {
+
+    fsrv->map_summary_target = false;
+    if (!be_quiet) {
+
+      WARNF(
+          "The target wrote coverage to %u map chunks without a mark in the "
+          "map summary. afl-fuzz now scans the full map (slower).",
+          unmarked);
+
+    }
+
+  }
+
+}
+
 static fsrv_run_result_t afl_fsrv_run_target_once(afl_forkserver_t *fsrv,
                                                   u32               timeout,
                                                   volatile u8 *stop_soon_p);
@@ -2854,6 +2921,14 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
   fsrv_run_result_t ret = afl_fsrv_run_target_once(fsrv, timeout, stop_soon_p);
 
   afl_fsrv_map_summary_check_revoked(fsrv);
+
+  if (fsrv->map_summary_target &&
+      unlikely(++fsrv->map_summary_runs >= MAP_SUMMARY_AUDIT)) {
+
+    fsrv->map_summary_runs = 0;
+    afl_fsrv_map_summary_audit(fsrv);
+
+  }
 
   return ret;
 

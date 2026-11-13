@@ -164,6 +164,7 @@ typedef struct afl_forkserver {
   bool map_summary_enable;              /* set by the tool: use the summary */
   bool map_summary_verify;              /* debug: check summary against map */
   bool map_summary_target;              /* the target marks the summary     */
+  u32  map_summary_runs;                /* runs since the last audit        */
 
   bool use_ijon;                        /* use IJON tracking feature        */
   bool use_value_profile;               /* target has L1 VP runtime support */

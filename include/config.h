@@ -574,6 +574,13 @@ We add 4 byte for one u32 length field. */
 #define MAP_SUMMARY_HDR_STALE 0
 #define MAP_SUMMARY_HDR_REVOKED 1
 
+/* afl-fuzz compares the summary of a target that marks it with the full map
+   after each MAP_SUMMARY_AUDIT runs. This finds code that writes to the map
+   without marks and that the target runtime cannot see, for example a helper
+   program from an older afl-cc. */
+
+#define MAP_SUMMARY_AUDIT 256
+
 /* Number of summary bytes (chunks) for a map of x bytes. */
 #define MAP_SUMMARY_CHUNKS(x) \
   (((size_t)(x) + MAP_SUMMARY_CHUNK - 1) >> MAP_SUMMARY_SHIFT)
