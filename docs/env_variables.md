@@ -1002,6 +1002,14 @@ checks or alter some of the more exotic semantics of the tool:
     afl-fuzz and the persistent target child. Setting `AFL_OLD_CHILD_SYNC`
     restores the old file descriptor based persistent synchronization behavior.
 
+  - With a large coverage map, afl-fuzz clears and checks only the parts of
+    the map that the last execution used. It keeps a map summary for this: one
+    byte for each 128 bytes of the map. Setting `AFL_NO_MAP_SUMMARY=1`
+    disables the map summary: afl-fuzz then clears and checks the full map for
+    each execution. Setting `AFL_MAP_SUMMARY_VERIFY=1` is for debugging only:
+    afl-fuzz compares the summary with the full map before each execution and
+    stops if they do not agree. This is slow.
+
   - The following environment variables are only needed if you implemented
     your own forkserver or persistent mode, or if __AFL_LOOP or __AFL_INIT
     are in a shared library and not the main binary:

@@ -735,6 +735,7 @@ u8 trim_case_custom(afl_state_t *afl, struct queue_entry *q, u8 *in_buf,
     q->len = out_len;
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace_custom, afl->fsrv.map_size);
+    afl_fsrv_map_summary_stale(&afl->fsrv);
     update_bitmap_score(afl, q, true);
 
   }

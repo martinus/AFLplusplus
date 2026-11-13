@@ -492,6 +492,8 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_NYX_REUSE_SNAPSHOT: reuse an existing Nyx root snapshot\n"
       DYN_COLOR
 
+      "AFL_NO_MAP_SUMMARY: always clear and check the full coverage map\n"
+      "AFL_MAP_SUMMARY_VERIFY: debug: compare the map summary with the map (slow)\n"
       "AFL_OLD_CHILD_SYNC: use file descriptor persistent-mode synchronization\n"
       "                    instead of the default shared memory + futex path\n"
       "                    (Linux only)\n"
@@ -699,6 +701,9 @@ afl_state_t *afl_init(void) {
   afl->default_output = 1;
 
   afl_fsrv_init(&afl->fsrv);
+  /* Use the map summary (see MAP_SUMMARY_SHIFT in config.h). */
+  afl->fsrv.map_summary_enable = !getenv("AFL_NO_MAP_SUMMARY");
+  afl->fsrv.map_summary_verify = !!getenv("AFL_MAP_SUMMARY_VERIFY");
   if (debug) { afl->fsrv.debug = true; }
 
   afl->runs_in_current_cycle = (u32)-1;

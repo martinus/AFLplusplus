@@ -388,14 +388,14 @@ static inline u8 has_new_bits_unclassified(afl_state_t *afl, u8 *virgin_map,
                                            bool *classified) {
 
   /* Handle the hot path first: no new coverage */
-  u8 *end = afl->fsrv.trace_bits + afl->fsrv.map_size;
 
 #ifdef WORD_SIZE_64
 
-  if (!skim((u64 *)virgin_map, (u64 *)afl->fsrv.trace_bits, (u64 *)end))
-    return 0;
+  if (!skim_summary(&afl->fsrv, (u64 *)virgin_map)) return 0;
 
 #else
+
+  u8 *end = afl->fsrv.trace_bits + afl->fsrv.map_size;
 
   if (!skim((u32 *)virgin_map, (u32 *)afl->fsrv.trace_bits, (u32 *)end))
     return 0;

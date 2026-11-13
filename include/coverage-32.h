@@ -41,6 +41,9 @@ void simplify_trace(afl_state_t *afl, u8 *bytes) {
   u32 *mem = (u32 *)bytes;
   u32  i = (afl->fsrv.map_size >> 2);
 
+  /* This writes to all bytes, also to those that are 0. */
+  if (bytes == afl->fsrv.trace_bits) { afl_fsrv_map_summary_stale(&afl->fsrv); }
+
   while (i--) {
 
     /* Optimize for sparse bitmaps. */

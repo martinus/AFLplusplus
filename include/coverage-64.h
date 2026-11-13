@@ -47,6 +47,9 @@ void simplify_trace(afl_state_t *afl, u8 *bytes) {
   u64 *mem = (u64 *)bytes;
   u32  i = (afl->fsrv.map_size >> 3);
 
+  /* This writes to all bytes, also to those that are 0. */
+  if (bytes == afl->fsrv.trace_bits) { afl_fsrv_map_summary_stale(&afl->fsrv); }
+
   while (i--) {
 
     /* Optimize for sparse bitmaps. */
@@ -210,6 +213,99 @@ inline u32 skim(const u64 *virgin, const u64 *current, const u64 *current_end) {
 }
 
 #endif
+
+/* Returns 1 if a block of words (a multiple of PACK_SIZE bytes) is not 0. */
+static inline u32 map_chunk_nonzero(const u64 *current, u32 words) {
+
+  u32 i = 0;
+
+#if defined(__AVX2__)
+  __m256i acc = _mm256_setzero_si256();
+  for (; i + 4 <= words; i += 4) {
+
+    acc = _mm256_or_si256(acc,
+                          _mm256_loadu_si256((const __m256i *)(current + i)));
+
+  }
+
+  if (!_mm256_testz_si256(acc, acc)) { return 1; }
+#endif
+
+  u64 rest = 0;
+  for (; i < words; ++i) {
+
+    rest |= current[i];
+
+  }
+
+  return rest != 0;
+
+}
+
+/* The same result as skim() for the full map, but with the map summary (see
+   MAP_SUMMARY_SHIFT in config.h), if the forkserver has one.
+
+   If the summary is valid, only the marked chunks can contain data, and only
+   these are checked. If it is stale, all chunks are read, and each chunk that
+   is not 0 gets a mark. After a complete scan the summary is valid: then
+   afl_fsrv_clear_map() and later scans of this run use the fast path. */
+
+static inline u32 skim_summary(afl_forkserver_t *fsrv, const u64 *virgin) {
+
+  const u64 *current = (const u64 *)fsrv->trace_bits;
+  size_t     map_words = fsrv->map_size >> 3;
+  u8        *hdr = afl_fsrv_map_summary(fsrv);
+  u32        chunks = MAP_SUMMARY_CHUNKS(fsrv->map_size);
+  const u32  chunk_words = MAP_SUMMARY_CHUNK >> 3;
+
+  if (unlikely(!hdr || chunks > afl_fsrv_map_summary_cap(fsrv) ||
+               (map_words << 3) % PACK_SIZE)) {
+
+    return skim(virgin, current, current + map_words);
+
+  }
+
+  u8 *marks = hdr + MAP_SUMMARY_HDR;
+  u8  stale = hdr[MAP_SUMMARY_HDR_STALE];
+
+  for (u32 c = 0; c < chunks; ++c) {
+
+    if (likely(!stale)) {
+
+      c = map_summary_next(marks, chunks, c);
+      if (c >= chunks) { break; }
+
+    }
+
+    /* Only the last chunk can be shorter. */
+    size_t beg = (size_t)c * chunk_words;
+    size_t end = beg + chunk_words;
+    if (unlikely(end > map_words)) { end = map_words; }
+
+    if (unlikely(stale)) {
+
+      if (likely(!map_chunk_nonzero(current + beg, (u32)(end - beg)))) {
+
+        continue;
+
+      }
+
+      marks[c] = 1;
+
+    }
+
+    if (unlikely(skim(virgin + beg, current + beg, current + end))) {
+
+      return 1;
+
+    }
+
+  }
+
+  hdr[MAP_SUMMARY_HDR_STALE] = 0;
+  return 0;
+
+}
 
 #endif
 

@@ -1512,6 +1512,7 @@ u8 trim_case(afl_state_t *afl, struct queue_entry *q, u8 *in_buf) {
     queue_testcase_retake_mem(afl, q, in_buf, q->len, orig_len);
 
     memcpy(afl->fsrv.trace_bits, afl->clean_trace, afl->fsrv.map_size);
+    afl_fsrv_map_summary_stale(&afl->fsrv);
     update_bitmap_score(afl, q, true);
     u8 had_vp_ref = q->vp_ref_cnt;
     if (unlikely(afl->value_profile_active && had_vp_ref)) {

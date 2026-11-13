@@ -159,6 +159,11 @@ typedef struct afl_forkserver {
   u32 *child_sync;                      /* shared word: fuzzer↔child sync   */
   u32  child_sync_offset;        /* byte offset of child_sync in trace_bits */
 
+  /* Map summary: one byte for each chunk of the map, see MAP_SUMMARY_SHIFT
+     in config.h. It tells which chunks of trace_bits can contain data. */
+  bool map_summary_enable;              /* set by the tool: use the summary */
+  bool map_summary_verify;              /* debug: check summary against map */
+
   bool use_ijon;                        /* use IJON tracking feature        */
   bool use_value_profile;               /* target has L1 VP runtime support */
 
@@ -290,6 +295,96 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 u32  afl_fsrv_get_mapsize(afl_forkserver_t *fsrv, char **argv,
                           volatile u8 *stop_soon_p, u8 debug_child_output);
 void afl_fsrv_write_to_testcase(afl_forkserver_t *fsrv, u8 *buf, size_t len);
+
+/* Returns the header of the map summary of trace_bits, or NULL if this
+   forkserver does not use one. afl_shm_init() puts the summary behind the
+   child_sync word, so no summary is used if the tool did not ask for it, if
+   trace_bits is not a shared map from afl_shm_init() (then there is no
+   offset), or in Nyx mode (Nyx does not use afl_fsrv_clear_map()).
+   The location is computed for each call and not stored, because the caller
+   can replace trace_bits. */
+static inline u8 *afl_fsrv_map_summary(afl_forkserver_t *fsrv) {
+
+#if defined(__linux__) || defined(__APPLE__)
+  if (!fsrv->map_summary_enable || !fsrv->child_sync_offset ||
+      !fsrv->trace_bits) {
+
+    return NULL;
+
+  }
+
+  #ifdef __linux__
+  if (fsrv->nyx_mode) { return NULL; }
+  #endif
+
+  return fsrv->trace_bits + MAP_SUMMARY_OFFSET(fsrv->child_sync_offset);
+#else
+  (void)fsrv;
+  return NULL;
+#endif
+
+}
+
+/* Number of chunks that the map summary of this forkserver has. */
+static inline u32 afl_fsrv_map_summary_cap(afl_forkserver_t *fsrv) {
+
+  return (u32)MAP_SUMMARY_CHUNKS(fsrv->child_sync_offset);
+
+}
+
+/* Code other than the target changed trace_bits (for example
+   simplify_trace(), or a memcpy() into the map). Then the map summary does
+   not describe the map: the next clear or scan must use the full map. */
+static inline void afl_fsrv_map_summary_stale(afl_forkserver_t *fsrv) {
+
+  u8 *hdr = afl_fsrv_map_summary(fsrv);
+  if (hdr) { hdr[MAP_SUMMARY_HDR_STALE] = 1; }
+
+}
+
+/* Returns the index of the first marked chunk in [from, chunks), or chunks if
+   there is none. marks is the summary without its header. */
+static inline u32 map_summary_next(const u8 *marks, u32 chunks, u32 from) {
+
+  const u64 *sum = (const u64 *)marks;
+  u32        words = (chunks + 7) >> 3;
+  u32        w = from >> 3;
+
+  if (w >= words) { return chunks; }
+
+  /* Ignore the bytes of the first word that are in front of `from`. */
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  u64 v = sum[w] & (~0ULL >> ((from & 7) * 8));
+#else
+  u64 v = sum[w] & (~0ULL << ((from & 7) * 8));
+#endif
+
+  while (!v) {
+
+    ++w;
+
+    /* Most of the summary is 0: skip it in blocks of 4 words. */
+    while (w + 4 <= words && !(sum[w] | sum[w + 1] | sum[w + 2] | sum[w + 3])) {
+
+      w += 4;
+
+    }
+
+    if (w >= words) { return chunks; }
+    v = sum[w];
+
+  }
+
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  u32 c = w * 8 + ((u32)__builtin_clzll(v) >> 3);
+#else
+  u32 c = w * 8 + ((u32)__builtin_ctzll(v) >> 3);
+#endif
+
+  return c < chunks ? c : chunks;
+
+}
+
 fsrv_run_result_t afl_fsrv_run_target(afl_forkserver_t *fsrv, u32 timeout,
                                       volatile u8 *stop_soon_p);
 void              afl_fsrv_killall(void);

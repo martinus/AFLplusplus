@@ -536,6 +536,9 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
 
   }
 
+  fsrv->map_summary_enable = false;
+  fsrv->map_summary_verify = false;
+
 #if defined(__linux__) || defined(__APPLE__)
   fsrv->use_futex = false;
   fsrv->child_sync = NULL;
@@ -592,6 +595,9 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
 
   fsrv_to->late_send = from->late_send;
   fsrv_to->custom_data_ptr = from->custom_data_ptr;
+
+  fsrv_to->map_summary_enable = from->map_summary_enable;
+  fsrv_to->map_summary_verify = from->map_summary_verify;
 
 #if defined(__linux__) || defined(__APPLE__)
   fsrv_to->use_futex = from->use_futex;
@@ -1277,6 +1283,9 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
   afl_child_sync_setup(fsrv);
 
 #endif
+
+  /* The summary does not describe what the new target leaves in the map. */
+  afl_fsrv_map_summary_stale(fsrv);
 
   fsrv->last_run_timed_out = 0;
   fsrv->fsrv_pid = fork();
@@ -2309,6 +2318,7 @@ void afl_fsrv_kill(afl_forkserver_t *fsrv) {
 
   fsrv->fsrv_pid = -1;
   fsrv->child_pid = -1;
+
 #ifdef AFL_PERSISTENT_RECORD
   if (fsrv->persistent_record_data) {
 
@@ -2659,6 +2669,79 @@ static inline void afl_fsrv_persistent_record_reset(afl_forkserver_t *fsrv) {
 
 #endif
 
+/* Set trace_bits to 0 before a run. If the map summary is valid, only the
+   chunks that it marks can contain data, so only these are cleared. */
+
+static inline void afl_fsrv_clear_map(afl_forkserver_t *fsrv) {
+
+  u8    *hdr = afl_fsrv_map_summary(fsrv);
+  u8    *map = fsrv->trace_bits;
+  size_t map_size = fsrv->map_size;
+
+  if (!hdr) {
+
+    memset(map, 0, map_size);
+    return;
+
+  }
+
+  u8 *marks = hdr + MAP_SUMMARY_HDR;
+  u32 chunks = MAP_SUMMARY_CHUNKS(map_size);
+
+  if (likely(!hdr[MAP_SUMMARY_HDR_STALE] &&
+             chunks <= afl_fsrv_map_summary_cap(fsrv))) {
+
+    if (unlikely(fsrv->map_summary_verify)) {
+
+      for (size_t i = 0; i < map_size; ++i) {
+
+        if (unlikely(map[i] && !marks[i >> MAP_SUMMARY_SHIFT])) {
+
+          FATAL(
+              "Map summary is wrong: map[%zu] = %u, but chunk %zu has no mark. "
+              "Please report this.",
+              i, map[i], i >> MAP_SUMMARY_SHIFT);
+
+        }
+
+      }
+
+    }
+
+    for (u32 c = map_summary_next(marks, chunks, 0); c < chunks;
+         c = map_summary_next(marks, chunks, c + 1)) {
+
+      size_t off = (size_t)c << MAP_SUMMARY_SHIFT;
+
+      /* Only the last chunk can be shorter. The constant size lets the
+         compiler inline the other memset(). */
+      if (likely(c + 1 < chunks)) {
+
+        memset(map + off, 0, MAP_SUMMARY_CHUNK);
+
+      } else {
+
+        memset(map + off, 0, map_size - off);
+
+      }
+
+      marks[c] = 0;
+
+    }
+
+  } else {
+
+    memset(map, 0, map_size);
+    memset(marks, 0, afl_fsrv_map_summary_cap(fsrv));
+
+  }
+
+  /* Nobody marks the chunks during the run. The summary is not valid until
+     somebody scans the full map and marks the chunks that are not 0. */
+  hdr[MAP_SUMMARY_HDR_STALE] = 1;
+
+}
+
 /* Execute target application, monitoring for timeouts. Return status
    information. The called program will update afl->fsrv->trace_bits. */
 
@@ -2758,14 +2841,14 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
 #ifdef __linux__
     if (likely(!fsrv->nyx_mode)) {
 
-      memset(fsrv->trace_bits, 0, fsrv->map_size);
+      afl_fsrv_clear_map(fsrv);
       MEM_BARRIER();
 
     }
 
 #else
     // Clear shared memory for clean execution
-    memset(fsrv->trace_bits, 0, fsrv->map_size);
+    afl_fsrv_clear_map(fsrv);
     MEM_BARRIER();
 #endif
 

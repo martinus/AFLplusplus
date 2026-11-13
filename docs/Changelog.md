@@ -10,6 +10,10 @@
     - timeout fix for slow starting targets (until they reach the fork server)
     - fix for AFL_NO_STARTUP_CALIBRATION (don't use it, change your setup)
     - improve cmplog pipe, more speed (thanks to @martinus)
+    - map summary: with a large coverage map, afl-fuzz now clears only the
+      parts of the map that the last execution used (up to 25% more
+      executions per second with a 1.5 MB map and a short test).
+      `AFL_NO_MAP_SUMMARY=1` disables it.
   - custom mutators
     - added `custom_mutators/compiler_fuzzer`: the afl-compiler-fuzzer
       source-level mutations (and its comby-decomposer mode) as custom
