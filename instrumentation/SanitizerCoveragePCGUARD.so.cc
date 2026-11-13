@@ -101,6 +101,14 @@ const char SanCovModuleCtorTracePcGuardName[] =
     "sancov.module_ctor_trace_pc_guard";
 const char SanCovTracePCGuardInitName[] = "__sanitizer_cov_trace_pc_guard_init";
 
+/* With AFL_LLVM_MAP_SUMMARY the module registers with a different function,
+   so the runtime knows that this module marks the map summary. The constructor
+   has a different name too: if a library has modules of both types, the linker
+   keeps both constructors and the runtime sees both. */
+const char AFLSummaryModuleCtorName[] =
+    "sancov.module_ctor_trace_pc_guard.afl_summary";
+const char AFLSummaryInitName[] = "__afl_pc_guard_init_summary";
+
 const char SanCovTracePCGuardName[] = "__sanitizer_cov_trace_pc_guard";
 
 const char SanCovGuardsSectionName[] = "sancov_guards";
@@ -153,6 +161,8 @@ class ModuleSanitizerCoverageAFL
   void CreateFunctionLocalArrays(Function &F, ArrayRef<BasicBlock *> AllBlocks,
                                  uint32_t special);
   void InjectCoverageAtBlock(Function &F, BasicBlock &BB, size_t Idx);
+  Value    *markMapSummary(IRBuilder<> &IRB, Value *CoverageIndex);
+  void      markMapSummaryAgain(IRBuilder<> &IRB, Value *ChunkPtr);
   Function *CreateInitCallsForSections(Module &M, const char *CtorName,
                                        const char *InitFunctionName, Type *Ty,
                                        const char *Section);
@@ -204,6 +214,9 @@ class ModuleSanitizerCoverageAFL
   GlobalVariable     *AFLCovMapSize = NULL;
   GlobalVariable     *AFLIJONState = NULL;
   Value              *HoistedMapPtr = NULL;
+  GlobalVariable     *AFLSummaryPtr = NULL;
+  Value              *HoistedSummaryPtr = NULL;
+  bool                map_summary = false;
   ConstantInt        *One = NULL;
   ConstantInt        *Zero = NULL;
   bool                deny_exec = false;
@@ -407,6 +420,7 @@ void ModuleSanitizerCoverageAFL::setupEnvironmentVariables() {
 
   skip_nozero = getenv("AFL_LLVM_SKIP_NEVERZERO");
   use_threadsafe_counters = getenv("AFL_LLVM_THREADSAFE_INST");
+  map_summary = getenv("AFL_LLVM_MAP_SUMMARY") != nullptr;
   ijon_enabled = getenv("AFL_LLVM_IJON");
   if (getenv("AFL_LLVM_DENY_EXEC")) { deny_exec = true; }
   if (getenv("AFL_LLVM_ABORTLIST")) { abort_list = true; }
@@ -711,9 +725,58 @@ bool ModuleSanitizerCoverageAFL::isNoAbortFunction(Function &F) {
 
 }
 
+/* Mark the chunk of the map that contains CoverageIndex in the map summary
+   (see MAP_SUMMARY_SHIFT in config.h). This must be before the code that
+   changes the map: if the process stops between the two, a mark without a
+   counter does no harm. Returns the address of the mark, or nullptr if marks
+   are off. */
+
+Value *ModuleSanitizerCoverageAFL::markMapSummary(IRBuilder<> &IRB,
+                                                  Value       *CoverageIndex) {
+
+  if (!map_summary) { return nullptr; }
+
+  Value *SummaryPtr = HoistedSummaryPtr;
+  if (!SummaryPtr) {
+
+    auto *L = IRB.CreateLoad(PtrTy, AFLSummaryPtr);
+    setNoSanitizeMetadata(L);
+    SummaryPtr = L;
+
+  }
+
+  Value *Chunk = IRB.CreateLShr(
+      CoverageIndex,
+      ConstantInt::get(CoverageIndex->getType(), MAP_SUMMARY_SHIFT));
+  Value     *ChunkPtr = IRB.CreateGEP(Int8Ty, SummaryPtr, Chunk);
+  StoreInst *Mark = IRB.CreateStore(One, ChunkPtr);
+  setNoSanitizeMetadata(Mark);
+  return ChunkPtr;
+
+}
+
+/* With AFL_LLVM_THREADSAFE_INST, mark the chunk a second time behind the code
+   that changes the map. The fuzzer clears the marks and the map between two
+   runs. A thread of the target that runs at that time can set its mark, lose
+   it to the fuzzer, and then change the counter. The second mark repairs
+   this. Without it, afl-fuzz finds such a counter in its next audit (see
+   MAP_SUMMARY_AUDIT in config.h) and then stops to trust the marks. */
+
+void ModuleSanitizerCoverageAFL::markMapSummaryAgain(IRBuilder<> &IRB,
+                                                     Value       *ChunkPtr) {
+
+  if (!ChunkPtr || !use_threadsafe_counters) { return; }
+
+  StoreInst *Mark = IRB.CreateStore(One, ChunkPtr);
+  setNoSanitizeMetadata(Mark);
+
+}
+
 void ModuleSanitizerCoverageAFL::updateCoverageBitmap(IRBuilder<> &IRB,
                                                       Value *CoverageIndex,
                                                       Value *MapPtr) {
+
+  Value *SummaryMark = markMapSummary(IRB, CoverageIndex);
 
   Value *MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);
 
@@ -742,6 +805,8 @@ void ModuleSanitizerCoverageAFL::updateCoverageBitmap(IRBuilder<> &IRB,
     setNoSanitizeMetadata(StoreCtx);
 
   }
+
+  markMapSummaryAgain(IRB, SummaryMark);
 
 }
 
@@ -998,6 +1063,8 @@ void ModuleSanitizerCoverageAFL::updateCoverageForSelect(IRBuilder<> &IRB,
 
     }
 
+    Value *SummaryMark = markMapSummary(IRB, CoverageIndex);
+
     MapPtrIdx = IRB.CreateGEP(Int8Ty, MapPtr, CoverageIndex);
 
     if (use_threadsafe_counters) {
@@ -1025,6 +1092,8 @@ void ModuleSanitizerCoverageAFL::updateCoverageForSelect(IRBuilder<> &IRB,
       setNoSanitizeMetadata(StoreCtx);
 
     }
+
+    markMapSummaryAgain(IRB, SummaryMark);
 
     if (!vector_cnt) {
 
@@ -1057,8 +1126,18 @@ Function *ModuleSanitizerCoverageAFL::CreateInitCallsForSections(
   auto      SecStart = SecStartEnd.first;
   auto      SecEnd = SecStartEnd.second;
   Function *CtorFunc;
+  /* The init function for modules with summary marks also gets the shift. */
+  SmallVector<Type *, 3>  ArgTypes = {PtrTy, PtrTy};
+  SmallVector<Value *, 3> Args = {SecStart, SecEnd};
+  if (map_summary) {
+
+    ArgTypes.push_back(Int32Ty);
+    Args.push_back(ConstantInt::get(Int32Ty, MAP_SUMMARY_SHIFT));
+
+  }
+
   std::tie(CtorFunc, std::ignore) = createSanitizerCtorAndInitFunctions(
-      M, CtorName, InitFunctionName, {PtrTy, PtrTy}, {SecStart, SecEnd});
+      M, CtorName, InitFunctionName, ArgTypes, Args);
 
   if (TargetTriple.supportsCOMDAT()) {
 
@@ -1144,6 +1223,16 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   if (!AFLMapPtr)
     AFLMapPtr = new GlobalVariable(
         M, PtrTy, false, GlobalValue::ExternalLinkage, 0, "__afl_area_ptr");
+  if (map_summary) {
+
+    AFLSummaryPtr = M.getGlobalVariable("__afl_map_summary_ptr");
+    if (!AFLSummaryPtr)
+      AFLSummaryPtr =
+          new GlobalVariable(M, PtrTy, false, GlobalValue::ExternalLinkage, 0,
+                             "__afl_map_summary_ptr");
+
+  }
+
   AFLCovMapSize = new GlobalVariable(
       M, Int32Ty, false, GlobalValue::ExternalLinkage, 0, "__afl_cov_map_size");
 
@@ -1177,9 +1266,12 @@ bool ModuleSanitizerCoverageAFL::instrumentModule(
   Function *Ctor = nullptr;
 
   if (FunctionGuardArray)
-    Ctor = CreateInitCallsForSections(M, SanCovModuleCtorTracePcGuardName,
-                                      SanCovTracePCGuardInitName, Int32PtrTy,
-                                      SanCovGuardsSectionName);
+    Ctor = CreateInitCallsForSections(
+        M,
+        map_summary ? AFLSummaryModuleCtorName
+                    : SanCovModuleCtorTracePcGuardName,
+        map_summary ? AFLSummaryInitName : SanCovTracePCGuardInitName,
+        Int32PtrTy, SanCovGuardsSectionName);
 
   if (Ctor && debug) {
 
@@ -1810,6 +1902,7 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
   selects += cnt_sel;
 
   HoistedMapPtr = NULL;
+  HoistedSummaryPtr = NULL;
   /* hoistMapPointerLoad inserts a new entry block (preamble).  Never
      instrument that block with code that uses HoistedMapPtr — it would run
      before the load.  AllBlocks was collected earlier so the preamble is
@@ -1848,7 +1941,13 @@ bool ModuleSanitizerCoverageAFL::InjectCoverage(
 
     }
 
-    if (!isCoro) { HoistedMapPtr = hoistMapPointerLoad(F, AFLMapPtr, PtrTy); }
+    if (!isCoro) {
+
+      HoistedMapPtr = hoistMapPointerLoad(F, AFLMapPtr, PtrTy,
+                                          map_summary ? AFLSummaryPtr : nullptr,
+                                          &HoistedSummaryPtr);
+
+    }
 
   }
 

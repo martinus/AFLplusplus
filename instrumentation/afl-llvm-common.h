@@ -415,10 +415,15 @@ inline bool isFullyArtificialBlock(const llvm::BasicBlock *BB) {
 
    The preamble is marked synthetic so shouldInstrumentBlock() skips it even
    when block pruning is off - instrumenting it would insert a map access
-   ahead of the load it depends on. */
-inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
-                                        llvm::GlobalVariable *AFLMapPtr,
-                                        llvm::Type           *PtrTy) {
+   ahead of the load it depends on.
+
+   If AFLSummaryPtr is given, __afl_map_summary_ptr is loaded directly behind
+   the map pointer and returned in *SummaryLoad. This load is not marked
+   invariant: the runtime changes the pointer when the sink grows. */
+inline llvm::Value *hoistMapPointerLoad(
+    llvm::Function &F, llvm::GlobalVariable *AFLMapPtr, llvm::Type *PtrTy,
+    llvm::GlobalVariable *AFLSummaryPtr = nullptr,
+    llvm::Value         **SummaryLoad = nullptr) {
 
   using namespace llvm;
   LLVMContext &Ctx = F.getContext();
@@ -439,6 +444,15 @@ inline llvm::Value *hoistMapPointerLoad(llvm::Function       &F,
   auto       *Load = IRB.CreateLoad(PtrTy, AFLMapPtr);
   setNoSanitizeMetadata(Load);
   Load->setMetadata(LLVMContext::MD_invariant_load, MDNode::get(Ctx, {}));
+
+  if (AFLSummaryPtr && SummaryLoad) {
+
+    auto *Summary = IRB.CreateLoad(PtrTy, AFLSummaryPtr);
+    setNoSanitizeMetadata(Summary);
+    *SummaryLoad = Summary;
+
+  }
+
   IRB.CreateBr(OldEntry);
   markAflSyntheticBlock(Preamble);
 

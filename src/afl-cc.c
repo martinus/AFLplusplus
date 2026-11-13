@@ -3097,6 +3097,8 @@ static void maybe_usage(aflcc_state_t *aflcc, int argc, char **argv) {
             "variables:\n"
             "  AFL_LLVM_THREADSAFE_INST: instrument with thread safe counters, "
             "disables neverzero\n"
+            "  AFL_LLVM_MAP_SUMMARY: mark used map parts, so afl-fuzz is fast "
+            "with large maps (PCGUARD)\n"
 
             COUNTER_BEHAVIOUR
 

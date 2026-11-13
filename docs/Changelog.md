@@ -10,15 +10,18 @@
     - timeout fix for slow starting targets (until they reach the fork server)
     - fix for AFL_NO_STARTUP_CALIBRATION (don't use it, change your setup)
     - improve cmplog pipe, more speed (thanks to @martinus)
-    - map summary: with a large coverage map, afl-fuzz now clears only the
-      parts of the map that the last execution used (up to 25% more
-      executions per second with a 1.5 MB map and a short test).
-      `AFL_NO_MAP_SUMMARY=1` disables it.
+    - map summary: with a large coverage map, afl-fuzz now clears and checks
+      only the parts of the map that an execution used. Compile the target
+      with `AFL_LLVM_MAP_SUMMARY=1` for the full effect (about 4x more
+      executions per second with a 1.5 MB map and a short test). Without it
+      the gain is about 20%. `AFL_NO_MAP_SUMMARY=1` disables it.
   - custom mutators
     - added `custom_mutators/compiler_fuzzer`: the afl-compiler-fuzzer
       source-level mutations (and its comby-decomposer mode) as custom
       mutators, for fuzzing compilers with C-like input languages
   - afl-cc
+    - new `AFL_LLVM_MAP_SUMMARY=1` for PCGUARD: the target marks which parts
+      of the coverage map it used, see docs/env_variables.md
     - a plain `-fcf-protection` (part of the default hardened CFLAGS on
       Fedora/RHEL) was mistaken for `AFL_USE_CFISAN` and injected `-flto`,
       which silently disabled PCGUARD instrumentation for the target

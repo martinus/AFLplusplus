@@ -548,6 +548,43 @@ Setting `AFL_LLVM_THREADSAFE_INST` will inject code that implements thread safe
 counters. The overhead is a little bit higher compared to the older non-thread
 safe case. Note that this disables neverzero (see NOT_ZERO).
 
+Together with `AFL_LLVM_MAP_SUMMARY`, the code also marks the map summary a
+second time for each edge (see below).
+
+#### Map summary for large coverage maps (PCGUARD mode)
+
+A large target has a large coverage map, but one input usually hits only a
+small part of it. Without help, afl-fuzz must clear and check the full map for
+each execution. For a map of 1 MB this costs more time than a short test.
+
+Set `AFL_LLVM_MAP_SUMMARY=1` when you compile the target. Then the target also
+writes a small second map, the map summary. It has one byte for each 128 bytes
+of the coverage map and tells afl-fuzz which parts of the coverage map were
+used. afl-fuzz then clears and checks only these parts.
+
+  - Use this if `AFL_DUMP_MAP_SIZE=1 ./target` prints a value above about
+    250000 and the target runs more than about 1000 executions per second.
+  - The cost in the target is one more store instruction for each edge.
+  - Compile all instrumented code of the target with this setting: libraries,
+    libraries that the target loads later, and programs that the target
+    starts. afl-fuzz prints "Target marks the map summary" at startup if it
+    uses the summary.
+  - If some code of the target has no marks, afl-fuzz does not use the marks.
+    It then checks the full map after each execution, which is slower but
+    correct. The target finds such code itself in most cases. To find the
+    other cases, afl-fuzz compares the summary with the full map after each
+    256 executions. In both cases afl-fuzz prints a warning if this happens
+    after startup.
+  - If threads of the target run while afl-fuzz prepares the next execution
+    (for example a worker thread in persistent mode), also set
+    `AFL_LLVM_THREADSAFE_INST=1`. The target then marks the summary a second
+    time for each edge. Without it, afl-fuzz can find coverage without a mark
+    and then stops to use the marks.
+  - The summary is not used together with IJON or the bug map
+    (`AFL_LLVM_BUG_*`).
+  - Only afl-fuzz uses the summary. The target still works with all other
+    tools and with older versions of afl-fuzz.
+
 #### Deny exec* calls
 
 Setting `AFL_LLVM_DENY_EXEC=1` during compilation will cause the instrumented
@@ -1002,13 +1039,13 @@ checks or alter some of the more exotic semantics of the tool:
     afl-fuzz and the persistent target child. Setting `AFL_OLD_CHILD_SYNC`
     restores the old file descriptor based persistent synchronization behavior.
 
-  - With a large coverage map, afl-fuzz clears and checks only the parts of
-    the map that the last execution used. It keeps a map summary for this: one
-    byte for each 128 bytes of the map. Setting `AFL_NO_MAP_SUMMARY=1`
-    disables the map summary: afl-fuzz then clears and checks the full map for
-    each execution. Setting `AFL_MAP_SUMMARY_VERIFY=1` is for debugging only:
-    afl-fuzz compares the summary with the full map before each execution and
-    stops if they do not agree. This is slow.
+  - afl-fuzz uses a map summary to clear and check only the parts of the
+    coverage map that an execution used. This works best with a target that is
+    compiled with `AFL_LLVM_MAP_SUMMARY=1` (see above). Setting
+    `AFL_NO_MAP_SUMMARY=1` disables the map summary: afl-fuzz then clears and
+    checks the full map for each execution. Setting `AFL_MAP_SUMMARY_VERIFY=1`
+    is for debugging only: afl-fuzz compares the summary with the full map
+    before each execution and stops if they do not agree. This is slow.
 
   - The following environment variables are only needed if you implemented
     your own forkserver or persistent mode, or if __AFL_LOOP or __AFL_INIT
