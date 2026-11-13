@@ -533,7 +533,8 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
 
   /* Reserve the child_sync word right after the (4-byte aligned) map. */
   size_t sync_off = sync_extra ? ((map_size + 3) & ~(size_t)3) : 0;
-  size_t alloc_size = sync_off ? sync_off + sizeof(u32) : map_size;
+  /* The map summary is behind the child_sync word (see MAP_SUMMARY_SHIFT). */
+  size_t alloc_size = sync_off ? MAP_SUMMARY_END(sync_off) : map_size;
 
   /* configure the size of the shared memory segment */
   if (ftruncate(shm->g_shm_fd, alloc_size)) {
@@ -703,7 +704,8 @@ u8 *afl_shm_init(sharedmem_t *shm, size_t map_size,
   /* The child_sync word is 4-byte aligned and placed AFTER the compcov slack
      so neither coverage nor compcov can clobber it. */
   size_t sync_off = sync_extra ? ((base_size + 3) & ~(size_t)3) : 0;
-  size_t alloc_size = sync_off ? sync_off + sizeof(u32) : base_size;
+  /* The map summary is behind the child_sync word (see MAP_SUMMARY_SHIFT). */
+  size_t alloc_size = sync_off ? MAP_SUMMARY_END(sync_off) : base_size;
   shm->shm_id =
       shmget(IPC_PRIVATE, alloc_size, IPC_CREAT | IPC_EXCL | permission);
   if (shm->shm_id < 0) {

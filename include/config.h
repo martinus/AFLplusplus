@@ -550,6 +550,44 @@ We add 4 byte for one u32 length field. */
   #define MAP_INITIAL_SIZE MAP_SIZE
 #endif
 
+/* Map summary. The coverage map is split into chunks of
+   (1 << MAP_SUMMARY_SHIFT) bytes, and the summary has one byte for each chunk.
+   A summary byte that is not 0 means: the chunk can contain coverage. The
+   fuzzer then clears and checks only these chunks, so the cost of one
+   execution depends on the number of edges that were hit and not on the size
+   of the map. The summary is in the same shared memory as the map; see
+   afl_shm_init(). You must recompile afl-fuzz, the runtime and the target
+   after a change of the shift. */
+
+#define MAP_SUMMARY_SHIFT 7
+#define MAP_SUMMARY_CHUNK (1U << MAP_SUMMARY_SHIFT)
+
+/* The summary starts with a header of MAP_SUMMARY_HDR bytes. One byte of the
+   header is the "stale" flag: if it is not 0, the summary does not describe
+   the map, and the fuzzer must clear or check the full map. */
+
+#define MAP_SUMMARY_HDR 64
+#define MAP_SUMMARY_HDR_STALE 0
+
+/* Number of summary bytes (chunks) for a map of x bytes. */
+#define MAP_SUMMARY_CHUNKS(x) \
+  (((size_t)(x) + MAP_SUMMARY_CHUNK - 1) >> MAP_SUMMARY_SHIFT)
+
+/* The header and the summary are aligned to 64 bytes. The bytes of the
+   summary behind the last chunk are always 0, so code can read the summary
+   in words of 8 bytes. */
+#define MAP_SUMMARY_ALIGN(x) (((size_t)(x) + 63) & ~(size_t)63)
+
+/* Offset of the summary header in the shared memory. x is the offset of the
+   child_sync word (a u32), which is behind the map. */
+#define MAP_SUMMARY_OFFSET(x) MAP_SUMMARY_ALIGN((size_t)(x) + 4)
+
+/* Size of the shared memory with header and summary. The summary has a chunk
+   for each 128 bytes in front of the child_sync word. */
+#define MAP_SUMMARY_END(x)                   \
+  (MAP_SUMMARY_OFFSET(x) + MAP_SUMMARY_HDR + \
+   MAP_SUMMARY_ALIGN(MAP_SUMMARY_CHUNKS(x)))
+
 /* IJON max tracking map configuration */
 
 /* Number of IJON slots (power-of-2 for efficient bitmasking) */
